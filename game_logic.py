@@ -1,40 +1,40 @@
+import os
 import time
 import threading
-from enum import Enum
 from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List
+from enum import Enum
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-import aubio
+from colorama import Fore, Style, init as colorama_init
 
-# ====== CORES p/ logs bonitos ======
+# Tente importar aubio para pitch; se não houver, segue sem medir (resultado "perdeu")
 try:
-    from colorama import init as colorama_init, Fore, Style
-    colorama_init()
-    GREEN = Fore.GREEN; RED = Fore.RED; CYAN = Fore.CYAN; YELLOW = Fore.YELLOW; MAG = Fore.MAGENTA; RESET = Style.RESET_ALL; BOLD = Style.BRIGHT
+    import aubio  # type: ignore
+    HAS_AUBIO = True
 except Exception:
-    GREEN = RED = CYAN = YELLOW = MAG = RESET = BOLD = ""
+    HAS_AUBIO = False
 
-BOX = "═" * 58
-def box(title: str):
-    print(f"\n{BOX}\n{BOLD}{title}{RESET}\n{BOX}")
+colorama_init(autoreset=True)
 
-def kv(key: str, val: str):  # formata coluna
-    print(f"{key:<18}: {val}")
+# ======================= CONFIG PADRÃO DO JOGO =======================
+TARGET_PITCH_HZ = 440        # ~ G2
+TOLERANCE_HZ    = 40.0
+COUNTDOWN_S     = 3            # 3,2,1 e começa
 
-# ====== ESTADO ======
-class SessionState(str, Enum):
+# ======================= ESTADO & RESULTADO ==========================
+class SessionState(Enum):
     idle = "idle"
     countdown = "countdown"
     running = "running"
     finished = "finished"
+    stopping = "stopping"
 
 @dataclass
-class Result:
-    state: SessionState
+class SessionResult:
+    state: SessionState = SessionState.finished
     result: Optional[str] = None           # "ganhou" | "perdeu"
     hit_ratio: Optional[float] = None
     max_streak_s: Optional[float] = None
@@ -45,318 +45,351 @@ class Result:
     duration_s: Optional[float] = None
     error: Optional[str] = None
 
-# ====== DISPOSITIVOS ======
+# ======================= HELPERS DE LOG BONITO =======================
+def _banner(title: str) -> str:
+    bar = "═" * 60
+    return f"\n{Fore.CYAN}{bar}\n{title.center(60)}\n{bar}{Style.RESET_ALL}"
+
+def _kv(key: str, val: Any, color=Fore.WHITE) -> str:
+    return f"{color}{key:<18}{Style.RESET_ALL}: {val}"
+
+def _ok(msg: str) -> str:
+    return f"{Fore.GREEN}{msg}{Style.RESET_ALL}"
+
+def _warn(msg: str) -> str:
+    return f"{Fore.YELLOW}{msg}{Style.RESET_ALL}"
+
+def _err(msg: str) -> str:
+    return f"{Fore.RED}{msg}{Style.RESET_ALL}"
+
+# ======================= DISPOSITIVOS ================================
 def list_audio_devices() -> Dict[str, Any]:
-    """Retorna devices de áudio (entrada/saída) em formato amigável."""
+    """Retorna devices de áudio (entrada/saída) em tipos nativos."""
     info = sd.query_devices()
     defaults = sd.default.device  # [in, out]
-    inputs, outputs = [], []
-    for idx, dev in enumerate(info):
-        rec = dict(id=idx, name=dev["name"], max_input_channels=dev["max_input_channels"],
-                   max_output_channels=dev["max_output_channels"])
-        if dev["max_input_channels"] > 0:
-            inputs.append(rec)
-        if dev["max_output_channels"] > 0:
-            outputs.append(rec)
-    return {"defaults": defaults, "input": inputs, "output": outputs}
+    inputs: List[Dict[str, Any]] = []
+    outputs: List[Dict[str, Any]] = []
 
-# ====== ENGINE ======
+    for idx, dev in enumerate(info):
+        rec = dict(
+            id=int(idx),
+            name=str(dev.get("name", "")),
+            max_input_channels=int(dev.get("max_input_channels", 0)),
+            max_output_channels=int(dev.get("max_output_channels", 0)),
+        )
+        if rec["max_input_channels"] > 0:
+            inputs.append(rec)
+        if rec["max_output_channels"] > 0:
+            outputs.append(rec)
+
+    def _as_int(x):
+        try:
+            return int(x) if x is not None else None
+        except Exception:
+            return None
+
+    return {"defaults": [_as_int(defaults[0]), _as_int(defaults[1])], "input": inputs, "output": outputs}
+
+# ======================= ENGINE =====================================
 class GameEngine:
     def __init__(self):
-        # parâmetros do jogo
-        self.target_hz = 98.83           # alvo (pode vir do front depois)
-        self.tolerance_hz = 40.0         # zona de acerto ±
-        self.min_amp_threshold = 0.02    # rejeita ruído muito baixo
-        self.buffer_size = 2048
-        self.samplerate = 44100
-        self.hop_size = self.buffer_size // 2
-
-        # estado
         self.state: SessionState = SessionState.idle
-        self._countdown_s = 3
-        self._countdown_started_at: Optional[float] = None
-        self._start_ts: Optional[float] = None
         self._stop_flag = threading.Event()
-
-        # áudio/música
-        self.music_path: Optional[Path] = None
-        self.music_data: Optional[np.ndarray] = None
-        self.music_sr: Optional[int] = None
-        self.music_duration: Optional[float] = None
-
-        # devices selecionados
-        self.in_dev: Optional[int] = None
-        self.out_dev: Optional[int] = None
-
-        # medição
-        self._pitch_o = aubio.pitch("yin", self.buffer_size, self.hop_size, self.samplerate)
-        self._pitch_o.set_unit("Hz")
-        self._pitch_o.set_silence(-90)
-        self._alpha = 0.18  # suavização exponencial
-
-        # métricas
-        self._frames_valid = 0
-        self._hit_frames = 0
-        self._max_streak_s = 0.0
-        self._current_streak_s = 0.0
-        self._last_voice_pitch = 0.0
-        self._achieved_pitch_avg = 0.0
-        self._achieved_pitch_n = 0
-
-        self._result: Optional[Result] = None
         self._thread: Optional[threading.Thread] = None
 
-    # ---------- helpers ----------
-    def _resolve_music(self, music_path: Optional[str]) -> Tuple[Optional[np.ndarray], Optional[int], Optional[float], Optional[str]]:
-        """Carrega o arquivo de música (.wav)."""
-        # tentativa 1: arg explícito
-        if music_path:
-            p = Path(music_path).expanduser()
-        else:
-            # tentativa 2: arquivo padrão no projeto
-            p = Path("referencia_trecho.wav")
-
-        # se ainda não existir, tenta relativo ao diretório do projeto (root)
-        if not p.exists():
-            root = Path(__file__).resolve().parents[1]  # pasta do projeto
-            p2 = (root / p).resolve()
-            if p2.exists():
-                p = p2
-
-        # log de preparação
-        box(f"{CYAN}KARAOKÊ • RESOLVE AUDIO{RESET}")
-        msg = f"ok: {p}" if p.exists() else f"{RED}not found: {p}{RESET}"
-        kv("resolve", msg)
-        kv("cwd", str(Path('.').resolve()))
-
-        if not p.exists():
-            return None, None, None, f"Arquivo não encontrado: {p}"
-
-        try:
-            data, sr = sf.read(str(p), dtype='float32', always_2d=True)
-            mono = data[:, 0]  # usa canal L
-            duration = len(mono) / sr
-            self.music_path = p
-            self.music_data = mono
-            self.music_sr = sr
-            self.music_duration = duration
-
-            box(f"{GREEN}KARAOKÊ • AUDIO OK{RESET}")
-            kv("file", p.name)
-            kv("duration", f"{duration:.2f}s")
-            return mono, sr, duration, None
-        except Exception as e:
-            return None, None, None, f"Erro abrindo WAV: {e}"
-
-    def prepare(self, music_path: Optional[str], in_dev: Optional[int], out_dev: Optional[int]) -> None:
-        """Reseta estado e entra em countdown."""
-        self.stop()  # garante que não há sessão antiga
-        self._stop_flag.clear()
-        self._result = None
+        # sessão
+        self._music_path: Optional[str] = None
+        self._audio_data: Optional[np.ndarray] = None
+        self._sr: Optional[int] = None
+        self._duration_s: float = 0.0
 
         # devices
-        self.in_dev = in_dev
-        self.out_dev = out_dev
+        self._in_dev: Optional[int] = None
+        self._out_dev: Optional[int] = None
 
-        # logs bonitos
-        box(f"{MAG}KARAOKÊ • PREPARE{RESET}")
-        kv("input dev", str(self.in_dev if self.in_dev is not None else "default"))
-        kv("output dev", str(self.out_dev if self.out_dev is not None else "default"))
-        kv("music_path", str(music_path) if music_path else "referencia_trecho.wav")
-        kv("cwd", str(Path('.').resolve()))
-        kv("project_root", str(Path(__file__).resolve().parents[1]))
+        # progresso
+        self._t_start: Optional[float] = None
+        self._play_t: int = 0  # <-- ponteiro de reprodução (frames), AGORA na instância
 
-        # carrega música aqui? não — deixamos para a thread (com logs)
-        self.state = SessionState.countdown
-        self._countdown_started_at = time.time()
+        # resultado
+        self._result: Optional[SessionResult] = None
 
+    # ---------------------- utilidades de estado ----------------------
     def countdown_left(self) -> Optional[int]:
-        if self.state != SessionState.countdown or self._countdown_started_at is None:
+        if self.state != SessionState.countdown:
             return None
-        left = self._countdown_s - int(time.time() - self._countdown_started_at)
-        return max(0, left)
+        return None
 
     def progress(self) -> float:
-        if self.state != SessionState.running or self._start_ts is None or not self.music_duration:
+        if self.state != SessionState.running or self._t_start is None or self._duration_s <= 0:
             return 0.0
-        elapsed = time.time() - self._start_ts
-        return float(np.clip(elapsed / self.music_duration, 0.0, 1.0))
+        elapsed = time.time() - self._t_start
+        return float(max(0.0, min(1.0, elapsed / self._duration_s)))
 
     def status_message(self) -> str:
         if self.state == SessionState.idle:
-            return "Aguardando início"
+            return "Pronto para iniciar"
         if self.state == SessionState.countdown:
-            return f"Contagem: {self.countdown_left()}s"
+            return "Contagem regressiva…"
         if self.state == SessionState.running:
-            return "Tocando e medindo…"
+            p = int(self.progress() * 100)
+            return f"Executando ({p}%)"
         if self.state == SessionState.finished:
-            return "Sessão finalizada"
-        return ""
+            return "Finalizado"
+        if self.state == SessionState.stopping:
+            return "Encerrando…"
+        return "—"
 
-    def result_summary(self) -> Dict[str, Any]:
-        if self._result is None:
-            return {"state": self.state, "error": "Sem resultado"}
-        return asdict(self._result)
+    # ---------------------- ciclo de vida -----------------------------
+    def prepare(self, music_path: Optional[str], in_dev: Optional[int], out_dev: Optional[int]) -> None:
+        self._stop_flag.clear()
+        self._result = None
+        self._music_path = music_path or "referencia_trecho.wav"  # fallback (relativo ao cwd)
+        self._in_dev = in_dev
+        self._out_dev = out_dev
+        self._play_t = 0  # zera o ponteiro de reprodução
+        self.state = SessionState.countdown
+
+        print(_banner("KARAOKÊ • PREPARE"))
+        print(_kv("input dev", self._in_dev))
+        print(_kv("output dev", self._out_dev))
+        print(_kv("music_path", self._music_path))
+        print(_kv("cwd", os.getcwd()))
+        print(_kv("project_root", os.path.abspath(".")))
 
     def stop(self) -> None:
-        """Sinaliza cancelamento; usada também no prepare para reset limpo."""
-        if self.state in (SessionState.countdown, SessionState.running):
-            print(f"{YELLOW}[KARAOKÊ] stop requested{RESET}")
         self._stop_flag.set()
+        self.state = SessionState.stopping
+        print(_warn("stop requested"))
 
-    # ---------- main async ----------
-    def run_session_async(self):
-        """
-        Roda o ciclo completo em thread:
-        countdown → carregar música → tocar/analisar → fechar → finalizar.
-        """
-        # espera countdown
-        while self.state == SessionState.countdown and not self._stop_flag.is_set():
-            if self.countdown_left() == 0:
-                break
-            time.sleep(0.2)
+    def run_session_async(self) -> None:
+        try:
+            # -------- countdown ----------
+            for i in range(COUNTDOWN_S, 0, -1):
+                if self._stop_flag.is_set():
+                    self.state = SessionState.finished
+                    return
+                print(_kv("countdown", i, Fore.CYAN))
+                time.sleep(1)
 
-        if self._stop_flag.is_set():
-            self.state = SessionState.idle
-            return
+            # -------- carregar áudio ----------
+            print(_banner("KARAOKÊ • RESOLVE AUDIO"))
+            resolved, err = self._resolve_music_path(self._music_path)
+            print(_kv("resolve", _ok(f"ok: {resolved}") if err is None else _err(err)))
+            print(_kv("cwd", os.getcwd()))
 
-        # carrega música
-        data, sr, dur, err = self._resolve_music(None if self.music_path is None else str(self.music_path))
-        if data is None:
-            # se não veio do prepare, tenta novamente com "referencia_trecho.wav"
-            data, sr, dur, err = self._resolve_music("referencia_trecho.wav")
-        if data is None:
-            # falha definitiva
-            print(f"{RED}[KARAOKÊ] ERROR loading audio: {err}{RESET}")
-            self._result = Result(
+            if err:
+                self._finish_with_error(err)
+                return
+
+            print(_banner("KARAOKÊ • AUDIO OK"))
+            print(_kv("file", os.path.basename(resolved)))
+            print(_kv("duration", f"{self._duration_s:.2f}s"))
+
+            # -------- abrir streams ----------
+            print(_banner("KARAOKÊ • OPEN STREAMS"))
+            print(_kv("in dev", self._in_dev))
+            print(_kv("out dev", self._out_dev))
+            print(_kv("default", str(sd.default.device)))
+
+            self.state = SessionState.running
+            self._t_start = time.time()
+
+            print(_banner("KARAOKÊ • PLAYING & MEASURING"))
+
+            # tocar + medir
+            self._play_and_measure(resolved)
+
+            # imprime resultado ao final
+            self._finalize_and_print()
+
+        except Exception as e:
+            self._finish_with_error(str(e))
+
+    # ---------------------- áudio & medição ---------------------------
+    def _resolve_music_path(self, p: Optional[str]) -> Tuple[str, Optional[str]]:
+        if not p:
+            return "", "caminho de áudio vazio"
+
+        # absoluto ou relativo
+        candidate = p
+        if not os.path.isabs(candidate):
+            candidate = os.path.abspath(candidate)
+
+        try:
+            data, sr = sf.read(candidate, dtype="float32", always_2d=True)
+        except Exception as e:
+            return p, f"erro ao abrir áudio: {e}"
+
+        self._audio_data = data
+        self._sr = int(sr)
+        self._duration_s = float(len(data) / sr)
+        return candidate, None
+
+    def _play_and_measure(self, path: str) -> None:
+        if self._audio_data is None or self._sr is None:
+            raise RuntimeError("Áudio não carregado.")
+
+        data = self._audio_data
+        sr = self._sr
+
+        # configurando pitch detect se houver aubio
+        if HAS_AUBIO:
+            win_s = 1024
+            hop_s = 512
+            pitch_o = aubio.pitch("yin", win_s, hop_s, sr)
+            pitch_o.set_unit("Hz")
+            pitch_o.set_silence(-40)
+
+            frames_hits = 0
+            frames_valid = 0
+            max_streak = 0
+            current_streak = 0
+            pitches: List[float] = []
+
+        # callback do output: só toca a música
+        def out_cb(outdata, frames, time_info, status):
+            del time_info
+            if status:
+                print(_warn(f"OUTPUT status: {status}"))
+            # pegar o slice correspondente usando o ponteiro da INSTÂNCIA
+            t = self._play_t
+            end = t + frames
+            if end > len(data):
+                end = len(data)
+            chunk = data[t:end]
+            if len(chunk) < frames:
+                pad = np.zeros((frames - len(chunk), data.shape[1]), dtype=np.float32)
+                chunk = np.vstack([chunk, pad])
+            outdata[:] = chunk
+            self._play_t = end  # avança o ponteiro
+
+        # callback do input: mede pitch (se aubio disponível)
+        def in_cb(indata, frames, time_info, status):
+            del time_info
+            if status:
+                print(_warn(f"INPUT status: {status}"))
+            if not HAS_AUBIO:
+                return
+
+            nonlocal frames_hits, frames_valid, max_streak, current_streak, pitches  # noqa: F821
+
+            mono = np.mean(indata, axis=1).astype(np.float32)
+            hop = 512
+            for i in range(0, len(mono), hop):
+                buf = mono[i:i+hop]
+                if len(buf) < hop:
+                    pad = np.zeros(hop - len(buf), dtype=np.float32)
+                    buf = np.concatenate([buf, pad])
+                p = float(pitch_o(buf)[0])
+                if np.isfinite(p) and p > 0:
+                    frames_valid += 1
+                    pitches.append(p)
+                    if abs(p - TARGET_PITCH_HZ) <= TOLERANCE_HZ:
+                        frames_hits += 1
+                        current_streak += hop / sr
+                        if current_streak > max_streak:
+                            max_streak = current_streak
+                    else:
+                        current_streak = 0
+
+        # abrir streams
+        try:
+            with sd.OutputStream(
+                samplerate=sr,
+                channels=data.shape[1],
+                device=self._out_dev,
+                callback=out_cb,
+                dtype="float32",
+                finished_callback=lambda: None,
+            ), sd.InputStream(
+                samplerate=sr,
+                channels=1,
+                device=self._in_dev,
+                callback=in_cb,
+                dtype="float32",
+            ):
+                # roda até acabar a música ou pedirem stop
+                while not self._stop_flag.is_set() and self._play_t < len(data):
+                    time.sleep(0.05)
+        finally:
+            print(_banner("KARAOKÊ • STREAMS CLOSED"))
+
+        # computa resultado
+        if HAS_AUBIO:
+            hit_ratio = float(frames_hits / frames_valid) if frames_valid else 0.0
+            achieved = float(np.median(pitches)) if len(pitches) else None
+            self._result = SessionResult(
                 state=SessionState.finished,
-                result=None,
-                error=str(err)
+                result="ganhou" if hit_ratio >= 0.6 else "perdeu",
+                hit_ratio=hit_ratio,
+                max_streak_s=float(max_streak),
+                target_hz=float(TARGET_PITCH_HZ),
+                tolerance_hz=float(TOLERANCE_HZ),
+                achieved_pitch_hz=achieved,
+                frames_valid=int(frames_valid),
+                duration_s=float(self._duration_s),
+                error=None
             )
-            self.state = SessionState.finished
-            return
-
-        # toca e mede
-        self.state = SessionState.running
-        self._start_ts = time.time()
-        self._run_play_and_measure(data, sr)
-
-        # monta resultado
-        hit_ratio = (self._hit_frames / max(1, self._frames_valid))
-        achieved = (self._achieved_pitch_avg / max(1, self._achieved_pitch_n)) if self._achieved_pitch_n else None
-        verdict = "ganhou" if hit_ratio >= 0.5 else "perdeu"  # regra simples — ajuste depois
-
-        self._result = Result(
-            state=SessionState.finished,
-            result=verdict,
-            hit_ratio=round(hit_ratio, 3),
-            max_streak_s=round(self._max_streak_s, 2),
-            target_hz=round(self.target_hz, 2),
-            tolerance_hz=self.tolerance_hz,
-            achieved_pitch_hz=(round(achieved, 2) if achieved else None),
-            frames_valid=self._frames_valid,
-            duration_s=self.music_duration,
-            error=None
-        )
-
-        # log final (apenas ao terminar)
-        box(f"{BOLD}🎤 RESULTADO DA SESSÃO KARAOKÊ{RESET}")
-        kv("status", f"{GREEN}{verdict}{RESET}" if verdict == "ganhou" else f"{RED}{verdict}{RESET}")
-        kv("target_hz", f"{self.target_hz:.2f} Hz")
-        kv("achieved_hz", f"{achieved:.2f} Hz" if achieved else "—")
-        kv("hit_ratio", f"{hit_ratio:.3f}")
-        kv("max_streak_s", f"{self._max_streak_s:.2f}")
-        kv("frames_valid", f"{self._frames_valid}")
-        kv("duration_s", f"{self.music_duration:.1f}")
-        kv("tolerance_hz", f"{self.tolerance_hz:.1f}")
-
-        # pretty JSON para copiar/colar
-        import json
-        box("JSON")
-        print(json.dumps(asdict(self._result), indent=4, ensure_ascii=False))
+        else:
+            self._result = SessionResult(
+                state=SessionState.finished,
+                result="perdeu",
+                hit_ratio=0.0,
+                max_streak_s=0.0,
+                target_hz=float(TARGET_PITCH_HZ),
+                tolerance_hz=float(TOLERANCE_HZ),
+                achieved_pitch_hz=None,
+                frames_valid=0,
+                duration_s=float(self._duration_s),
+                error="aubio não instalado; sem medição"
+            )
 
         self.state = SessionState.finished
 
-    # ---------- audio run ----------
-    def _run_play_and_measure(self, music: np.ndarray, sr: int):
-        """
-        Abre duas streams:
-        - OutputStream: toca a música (buffer por buffer)
-        - InputStream : lê microfone, calcula pitch e atualiza métricas
-        """
-        box(f"{CYAN}KARAOKÊ • OPEN STREAMS{RESET}")
-        kv("in dev", str(self.in_dev if self.in_dev is not None else "default"))
-        kv("out dev", str(self.out_dev if self.out_dev is not None else "default"))
-        kv("default", str(sd.default.device))
+    def _finalize_and_print(self) -> None:
+        d = self.result_summary()
+        print(_banner("🎤 RESULTADO DA SESSÃO KARAOKÊ"))
+        print(_kv("status", d.get("result")))
+        print(_kv("target_hz", f'{d.get("target_hz")} Hz'))
+        print(_kv("achieved_hz", f'{d.get("achieved_pitch_hz")} Hz'))
+        print(_kv("hit_ratio", f'{d.get("hit_ratio")}'))
+        print(_kv("max_streak_s", f'{d.get("max_streak_s")}'))
+        print(_kv("frames_valid", f'{d.get("frames_valid")}'))
+        print(_kv("duration_s", f'{d.get("duration_s")}'))
+        print(_kv("tolerance_hz", f'{d.get("tolerance_hz")}'))
 
-        # prepara índices e flags
-        idx = 0
-        total_frames = len(music)
-        frames_per_block = self.hop_size
+        print(_banner("JSON"))
+        import json
+        print(json.dumps(d, indent=4, ensure_ascii=False))
 
-        # callbacks
-        def out_cb(outdata, frames, time_info, status):
-            nonlocal idx
-            if status:
-                print(f"{YELLOW}[OUTPUT] {status}{RESET}")
-            end = min(idx + frames, total_frames)
-            chunk = music[idx:end]
-            if len(chunk) < frames:
-                # preenche zeros no final
-                pad = np.zeros(frames - len(chunk), dtype=music.dtype)
-                chunk = np.concatenate([chunk, pad])
-            outdata[:, 0] = chunk
-            idx = end
-            if idx >= total_frames:
-                raise sd.CallbackStop()
+    def _finish_with_error(self, msg: str) -> None:
+        self._result = SessionResult(
+            state=SessionState.finished,
+            result="perdeu",
+            hit_ratio=0.0,
+            max_streak_s=0.0,
+            target_hz=float(TARGET_PITCH_HZ),
+            tolerance_hz=float(TOLERANCE_HZ),
+            achieved_pitch_hz=None,
+            frames_valid=0,
+            duration_s=float(self._duration_s),
+            error=msg
+        )
+        self.state = SessionState.finished
+        print(_err(f"ERROR: {msg}"))
 
-        def in_cb(indata, frames, time_info, status):
-            if status:
-                print(f"{YELLOW}[INPUT] {status}{RESET}")
-            samples = indata[:, 0].astype(np.float32)
-            pitch = self._pitch_o(samples)[0]
-            amp = np.max(np.abs(samples))
-            if 50.0 < pitch < 2000.0 and amp > self.min_amp_threshold:
-                # suavização
-                self._last_voice_pitch = (1 - self._alpha) * self._last_voice_pitch + self._alpha * pitch
-                self._frames_valid += 1
-                # métricas
-                if abs(self._last_voice_pitch - self.target_hz) <= self.tolerance_hz:
-                    self._hit_frames += 1
-                    self._current_streak_s += frames / self.samplerate
-                    self._max_streak_s = max(self._max_streak_s, self._current_streak_s)
-                else:
-                    self._current_streak_s = 0.0
-                # acumulador de média
-                self._achieved_pitch_avg += self._last_voice_pitch
-                self._achieved_pitch_n += 1
+    # ---------------------- saída pública -----------------------------
+    def result_summary(self) -> Dict[str, Any]:
+        if self._result is None:
+            return {"state": self.state.value, "error": "Sem resultado"}
+        d = asdict(self._result)
 
-        # toca e mede
-        box(f"{GREEN}KARAOKÊ • PLAYING & MEASURING{RESET}")
-        try:
-            with sd.InputStream(
-                device=self.in_dev,
-                channels=1,
-                samplerate=self.samplerate,
-                blocksize=self.hop_size,
-                callback=in_cb,
-            ), sd.OutputStream(
-                device=self.out_dev,
-                channels=1,
-                samplerate=sr,
-                blocksize=self.hop_size,
-                callback=out_cb,
-            ):
-                while idx < total_frames and not self._stop_flag.is_set():
-                    sd.sleep(20)
-        except Exception as e:
-            # falha ao abrir stream — guarda como resultado final também
-            msg = str(e)
-            print(f"{RED}[KARAOKÊ] PortAudio ERROR: {msg}{RESET}")
-            self._result = Result(
-                state=SessionState.finished,
-                result=None,
-                error=f"PortAudio: {msg}"
-            )
-        finally:
-            box(f"{YELLOW}KARAOKÊ • STREAMS CLOSED{RESET}")
+        # garantir tipos nativos & state como string
+        d["state"] = self._result.state.value if isinstance(self._result.state, SessionState) else str(self._result.state)
+        for k in ("target_hz", "tolerance_hz", "achieved_pitch_hz", "hit_ratio", "max_streak_s", "duration_s"):
+            if d.get(k) is not None:
+                d[k] = float(d[k])
+        if d.get("frames_valid") is not None:
+            d["frames_valid"] = int(d["frames_valid"])
+        return d
