@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+sounddevice
+aubio
+librosa
+pyqt5
