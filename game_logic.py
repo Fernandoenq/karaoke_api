@@ -10,19 +10,28 @@ import sounddevice as sd
 import soundfile as sf
 from colorama import Fore, Style, init as colorama_init
 
-# Tente importar aubio para pitch; se não houver, segue sem medir (resultado "perdeu")
+# ============================================================
+#  Versão sem AUBIO: usa LIBROSA (YIN) para detecção de pitch
+#  Requisitos:
+#      pip install librosa sounddevice soundfile colorama numpy
+#  Compatível com Windows + Python 3.10
+# ============================================================
 try:
-    import aubio  # type: ignore
-    HAS_AUBIO = True
+    import librosa  # type: ignore
+    HAS_LIBROSA = True
 except Exception:
-    HAS_AUBIO = False
+    HAS_LIBROSA = False
 
 colorama_init(autoreset=True)
 
 # ======================= CONFIG PADRÃO DO JOGO =======================
-TARGET_PITCH_HZ = 440        # ~ G2
+TARGET_PITCH_HZ = 440        # ~ A4 (padrão)
 TOLERANCE_HZ    = 40.0
-COUNTDOWN_S     = 3            # 3,2,1 e começa
+COUNTDOWN_S     = 3          # 3,2,1 e começa
+
+# Faixa típica de voz (ajuste se quiser outro instrumento/voz)
+FMIN_HZ = 70.0
+FMAX_HZ = 800.0
 
 # ======================= ESTADO & RESULTADO ==========================
 class SessionState(Enum):
@@ -46,6 +55,16 @@ class SessionResult:
     error: Optional[str] = None
 
 # ======================= HELPERS DE LOG BONITO =======================
+
+def _is_hit(pitch_hz: float, target_hz: float, tol_hz: float) -> bool:
+    # considera equivalências de oitava (×0.5, ×1, ×2, ×4, …)
+    for k in (-2, -1, 0, 1, 2):
+        t = target_hz * (2 ** k)
+        if abs(pitch_hz - t) <= tol_hz:
+            return True
+    return False
+
+
 def _banner(title: str) -> str:
     bar = "═" * 60
     return f"\n{Fore.CYAN}{bar}\n{title.center(60)}\n{bar}{Style.RESET_ALL}"
@@ -90,6 +109,70 @@ def list_audio_devices() -> Dict[str, Any]:
 
     return {"defaults": [_as_int(defaults[0]), _as_int(defaults[1])], "input": inputs, "output": outputs}
 
+# ======================= DETECTOR DE PITCH (LIBROSA) =================
+class LibrosaPitchDetector:
+    """
+    Detecção de pitch via YIN do librosa, em tempo real.
+    Mantém um buffer deslizante de tamanho frame_length e,
+    a cada hop, estima o f0 para a janela mais recente.
+    """
+    def __init__(
+        self,
+        sr: int,
+        fmin: float = FMIN_HZ,
+        fmax: float = FMAX_HZ,
+        frame_length: int = 2048,
+        hop_length: int = 512,
+        periodicity_threshold: float = 0.1,  # quanto menor, mais sensível
+    ):
+        self.sr = int(sr)
+        self.fmin = float(fmin)
+        self.fmax = float(fmax)
+        self.frame_length = int(frame_length)
+        self.hop_length = int(hop_length)
+        self.periodicity_threshold = float(periodicity_threshold)
+        self._buffer = np.zeros(0, dtype=np.float32)
+
+    def process_block(self, mono_block: np.ndarray) -> List[float]:
+        """
+        Recebe um bloco mono (float32) e retorna uma lista de f0 em Hz
+        (um valor por hop consumido). Pode retornar lista vazia.
+        """
+        if mono_block.ndim != 1:
+            mono_block = np.mean(mono_block, axis=-1)
+        mono_block = mono_block.astype(np.float32, copy=False)
+
+        # acumula
+        self._buffer = np.concatenate([self._buffer, mono_block])
+
+        f0_list: List[float] = []
+
+        # Enquanto houver amostras suficientes para um frame:
+        while len(self._buffer) >= self.frame_length:
+            frame = self._buffer[-self.frame_length:]  # janela mais recente
+
+            # O truque: hop_length == frame_length => 1 estimativa
+            try:
+                f0 = librosa.yin(
+                    y=frame,
+                    fmin=self.fmin,
+                    fmax=self.fmax,
+                    sr=self.sr,
+                    frame_length=self.frame_length,
+                    hop_length=self.frame_length,  # 1 saída
+                    trough_threshold=self.periodicity_threshold,  # controle de "voicing"
+                )
+                hz = float(f0[0]) if np.isfinite(f0[0]) else 0.0
+            except Exception:
+                hz = 0.0
+
+            f0_list.append(hz if (hz > 0.0 and np.isfinite(hz)) else 0.0)
+
+            # avança o buffer em hop_length
+            self._buffer = self._buffer[self.hop_length:]
+
+        return f0_list
+
 # ======================= ENGINE =====================================
 class GameEngine:
     def __init__(self):
@@ -109,7 +192,7 @@ class GameEngine:
 
         # progresso
         self._t_start: Optional[float] = None
-        self._play_t: int = 0  # <-- ponteiro de reprodução (frames), AGORA na instância
+        self._play_t: int = 0  # ponteiro de reprodução (frames)
 
         # resultado
         self._result: Optional[SessionResult] = None
@@ -227,74 +310,83 @@ class GameEngine:
         return candidate, None
 
     def _play_and_measure(self, path: str) -> None:
-        if self._audio_data is None or self._sr is None:
-            raise RuntimeError("Áudio não carregado.")
-
+        ...
         data = self._audio_data
         sr = self._sr
 
-        # configurando pitch detect se houver aubio
-        if HAS_AUBIO:
-            win_s = 1024
-            hop_s = 512
-            pitch_o = aubio.pitch("yin", win_s, hop_s, sr)
-            pitch_o.set_unit("Hz")
-            pitch_o.set_silence(-40)
+        # buffers maiores = CPU mais folgada = menos overflow
+        blocksize = 4096  # tente 2048 ou 4096
+        frame_len = blocksize
+        hop_len = blocksize
 
-            frames_hits = 0
-            frames_valid = 0
-            max_streak = 0
-            current_streak = 0
-            pitches: List[float] = []
+        if not HAS_LIBROSA:
+            print(_warn("librosa não encontrado — sessão seguirá sem medição de pitch."))
+        else:
+            detector = LibrosaPitchDetector(
+                sr=sr,
+                fmin=FMIN_HZ,
+                fmax=FMAX_HZ,
+                frame_length=frame_len,
+                hop_length=hop_len,
+                periodicity_threshold=0.08,  # um pouco mais sensível
+            )
 
-        # callback do output: só toca a música
+        frames_hits = 0
+        frames_valid = 0
+        max_streak = 0.0
+        current_streak = 0.0
+        pitches: List[float] = []
+
         def out_cb(outdata, frames, time_info, status):
             del time_info
             if status:
+                # não imprimir toda hora — apenas 1x a cada N, se quiser
                 print(_warn(f"OUTPUT status: {status}"))
-            # pegar o slice correspondente usando o ponteiro da INSTÂNCIA
             t = self._play_t
-            end = t + frames
-            if end > len(data):
-                end = len(data)
+            end = min(t + frames, len(data))
             chunk = data[t:end]
             if len(chunk) < frames:
                 pad = np.zeros((frames - len(chunk), data.shape[1]), dtype=np.float32)
                 chunk = np.vstack([chunk, pad])
             outdata[:] = chunk
-            self._play_t = end  # avança o ponteiro
+            self._play_t = end
 
-        # callback do input: mede pitch (se aubio disponível)
         def in_cb(indata, frames, time_info, status):
             del time_info
             if status:
+                # "input overflow" pode aparecer aqui — com o patch abaixo deve reduzir
                 print(_warn(f"INPUT status: {status}"))
-            if not HAS_AUBIO:
+
+            nonlocal frames_hits, frames_valid, max_streak, current_streak, pitches
+
+            if not HAS_LIBROSA:
                 return
 
-            nonlocal frames_hits, frames_valid, max_streak, current_streak, pitches  # noqa: F821
+            try:
+                # 1 estimativa por callback: usa o bloco inteiro
+                mono = np.mean(indata, axis=1).astype(np.float32)
+                f0_list = detector.process_block(mono)  # com hop=frame -> ~1 valor
 
-            mono = np.mean(indata, axis=1).astype(np.float32)
-            hop = 512
-            for i in range(0, len(mono), hop):
-                buf = mono[i:i+hop]
-                if len(buf) < hop:
-                    pad = np.zeros(hop - len(buf), dtype=np.float32)
-                    buf = np.concatenate([buf, pad])
-                p = float(pitch_o(buf)[0])
-                if np.isfinite(p) and p > 0:
-                    frames_valid += 1
-                    pitches.append(p)
-                    if abs(p - TARGET_PITCH_HZ) <= TOLERANCE_HZ:
-                        frames_hits += 1
-                        current_streak += hop / sr
-                        if current_streak > max_streak:
-                            max_streak = current_streak
+                for f0 in f0_list:
+                    if f0 > 0.0 and np.isfinite(f0):
+                        frames_valid += 1
+                        pitches.append(float(f0))
+                        if _is_hit(f0, TARGET_PITCH_HZ, TOLERANCE_HZ):  # ver função abaixo
+                            frames_hits += 1
+                            current_streak += frames / sr
+                            if current_streak > max_streak:
+                                max_streak = current_streak
+                        else:
+                            current_streak = 0.0
                     else:
-                        current_streak = 0
+                        current_streak = 0.0
+            except Exception as e:
+                print(_err(f"in_cb error: {e}"))
 
         # abrir streams
+
         try:
+            """
             with sd.OutputStream(
                 samplerate=sr,
                 channels=data.shape[1],
@@ -312,12 +404,25 @@ class GameEngine:
                 # roda até acabar a música ou pedirem stop
                 while not self._stop_flag.is_set() and self._play_t < len(data):
                     time.sleep(0.05)
+            """
+            with sd.InputStream(
+                    samplerate=sr,
+                    channels=1,
+                    device=self._in_dev,
+                    callback=in_cb,
+                    dtype="float32",
+            ):
+                # captura só por X segundos ou até stop
+                start_time = time.time()
+                while not self._stop_flag.is_set() and (time.time() - start_time) < self._duration_s:
+                    time.sleep(0.05)
+
         finally:
             print(_banner("KARAOKÊ • STREAMS CLOSED"))
 
         # computa resultado
-        if HAS_AUBIO:
-            hit_ratio = float(frames_hits / frames_valid) if frames_valid else 0.0
+        if frames_valid > 0:
+            hit_ratio = float(frames_hits / frames_valid)
             achieved = float(np.median(pitches)) if len(pitches) else None
             self._result = SessionResult(
                 state=SessionState.finished,
@@ -342,7 +447,9 @@ class GameEngine:
                 achieved_pitch_hz=None,
                 frames_valid=0,
                 duration_s=float(self._duration_s),
-                error="aubio não instalado; sem medição"
+                error=("librosa não instalado; sem medição"
+                       if not HAS_LIBROSA else
+                       "sem medições válidas (áudio baixo/ruído/sem voz detectada)")
             )
 
         self.state = SessionState.finished
