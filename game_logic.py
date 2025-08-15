@@ -1,6 +1,8 @@
 import os
 import time
 import threading
+import json
+import queue
 from dataclasses import dataclass, asdict
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple, List
@@ -63,7 +65,6 @@ def _is_hit(pitch_hz: float, target_hz: float, tol_hz: float) -> bool:
         if abs(pitch_hz - t) <= tol_hz:
             return True
     return False
-
 
 def _banner(title: str) -> str:
     bar = "═" * 60
@@ -179,6 +180,8 @@ class GameEngine:
         self.state: SessionState = SessionState.idle
         self._stop_flag = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._win_event = threading.Event()     # vitória antecipada
+        self._live_q: "queue.Queue[str]" = queue.Queue(maxsize=1000)  # fila de eventos ao vivo
 
         # sessão
         self._music_path: Optional[str] = None
@@ -196,6 +199,21 @@ class GameEngine:
 
         # resultado
         self._result: Optional[SessionResult] = None
+
+    # ---------------------- eventos ao vivo (SSE) ---------------------
+    def publish(self, kind: str, **payload):
+        """Empilha um evento JSON na fila /live."""
+        try:
+            msg = {"t": time.time(), "kind": kind, **payload}
+            s = json.dumps(msg, ensure_ascii=False)
+            if self._live_q.full():
+                try:
+                    self._live_q.get_nowait()  # descarta o mais antigo
+                except Exception:
+                    pass
+            self._live_q.put_nowait(s)
+        except Exception:
+            pass
 
     # ---------------------- utilidades de estado ----------------------
     def countdown_left(self) -> Optional[int]:
@@ -226,11 +244,12 @@ class GameEngine:
     # ---------------------- ciclo de vida -----------------------------
     def prepare(self, music_path: Optional[str], in_dev: Optional[int], out_dev: Optional[int]) -> None:
         self._stop_flag.clear()
+        self._win_event.clear()
         self._result = None
         self._music_path = music_path or "referencia_trecho.wav"  # fallback (relativo ao cwd)
         self._in_dev = in_dev
         self._out_dev = out_dev
-        self._play_t = 0  # zera o ponteiro de reprodução
+        self._play_t = 0
         self.state = SessionState.countdown
 
         print(_banner("KARAOKÊ • PREPARE"))
@@ -239,11 +258,13 @@ class GameEngine:
         print(_kv("music_path", self._music_path))
         print(_kv("cwd", os.getcwd()))
         print(_kv("project_root", os.path.abspath(".")))
+        self.publish("state", state="countdown", in_dev=self._in_dev, out_dev=self._out_dev, music=self._music_path)
 
     def stop(self) -> None:
         self._stop_flag.set()
         self.state = SessionState.stopping
         print(_warn("stop requested"))
+        self.publish("state", state="stopping")
 
     def run_session_async(self) -> None:
         try:
@@ -251,8 +272,10 @@ class GameEngine:
             for i in range(COUNTDOWN_S, 0, -1):
                 if self._stop_flag.is_set():
                     self.state = SessionState.finished
+                    self.publish("finished", **self.result_summary())
                     return
                 print(_kv("countdown", i, Fore.CYAN))
+                self.publish("countdown", left=i)
                 time.sleep(1)
 
             # -------- carregar áudio ----------
@@ -260,7 +283,6 @@ class GameEngine:
             resolved, err = self._resolve_music_path(self._music_path)
             print(_kv("resolve", _ok(f"ok: {resolved}") if err is None else _err(err)))
             print(_kv("cwd", os.getcwd()))
-
             if err:
                 self._finish_with_error(err)
                 return
@@ -268,6 +290,7 @@ class GameEngine:
             print(_banner("KARAOKÊ • AUDIO OK"))
             print(_kv("file", os.path.basename(resolved)))
             print(_kv("duration", f"{self._duration_s:.2f}s"))
+            self.publish("audio_resolved", file=resolved, duration_s=self._duration_s)
 
             # -------- abrir streams ----------
             print(_banner("KARAOKÊ • OPEN STREAMS"))
@@ -277,6 +300,7 @@ class GameEngine:
 
             self.state = SessionState.running
             self._t_start = time.time()
+            self.publish("state", state="running")
 
             print(_banner("KARAOKÊ • PLAYING & MEASURING"))
 
@@ -309,10 +333,33 @@ class GameEngine:
         self._duration_s = float(len(data) / sr)
         return candidate, None
 
+    # helper: vitória antecipada
+    def _declare_win_now(self, hit_ratio: float, max_streak: float, frames_valid: int,
+                         pitches: List[float]) -> None:
+        achieved = float(np.median(pitches)) if len(pitches) else None
+        self._result = SessionResult(
+            state=SessionState.finished,
+            result="ganhou",
+            hit_ratio=float(hit_ratio),
+            max_streak_s=float(max_streak),
+            target_hz=float(TARGET_PITCH_HZ),
+            tolerance_hz=float(TOLERANCE_HZ),
+            achieved_pitch_hz=achieved,
+            frames_valid=int(frames_valid),
+            duration_s=float(self._duration_s),
+            error=None
+        )
+        self.state = SessionState.finished
+        self._win_event.set()
+        self._stop_flag.set()
+        self.publish("win", ratio=float(hit_ratio))
+
     def _play_and_measure(self, path: str) -> None:
-        ...
         data = self._audio_data
         sr = self._sr
+        if data is None or sr is None:
+            self._finish_with_error("áudio não carregado")
+            return
 
         # buffers maiores = CPU mais folgada = menos overflow
         blocksize = 4096  # tente 2048 ou 4096
@@ -321,6 +368,7 @@ class GameEngine:
 
         if not HAS_LIBROSA:
             print(_warn("librosa não encontrado — sessão seguirá sem medição de pitch."))
+            self.publish("warn", message="librosa não encontrado")
         else:
             detector = LibrosaPitchDetector(
                 sr=sr,
@@ -337,11 +385,14 @@ class GameEngine:
         current_streak = 0.0
         pitches: List[float] = []
 
+        WIN_THRESHOLD = 0.6  # critério de vitória
+        last_emit = 0.0      # throttling (s)
+
         def out_cb(outdata, frames, time_info, status):
             del time_info
             if status:
-                # não imprimir toda hora — apenas 1x a cada N, se quiser
                 print(_warn(f"OUTPUT status: {status}"))
+                self.publish("output_status", status=str(status))
             t = self._play_t
             end = min(t + frames, len(data))
             chunk = data[t:end]
@@ -354,71 +405,76 @@ class GameEngine:
         def in_cb(indata, frames, time_info, status):
             del time_info
             if status:
-                # "input overflow" pode aparecer aqui — com o patch abaixo deve reduzir
                 print(_warn(f"INPUT status: {status}"))
+                self.publish("input_status", status=str(status))
 
-            nonlocal frames_hits, frames_valid, max_streak, current_streak, pitches
+            nonlocal frames_hits, frames_valid, max_streak, current_streak, pitches, last_emit
 
             if not HAS_LIBROSA:
                 return
 
             try:
-                # 1 estimativa por callback: usa o bloco inteiro
                 mono = np.mean(indata, axis=1).astype(np.float32)
-                f0_list = detector.process_block(mono)  # com hop=frame -> ~1 valor
+                f0_list = detector.process_block(mono)
 
                 for f0 in f0_list:
+                    ts = time.time()
                     if f0 > 0.0 and np.isfinite(f0):
                         frames_valid += 1
                         pitches.append(float(f0))
-                        if _is_hit(f0, TARGET_PITCH_HZ, TOLERANCE_HZ):  # ver função abaixo
+                        hit = _is_hit(f0, TARGET_PITCH_HZ, TOLERANCE_HZ)
+                        if hit:
                             frames_hits += 1
                             current_streak += frames / sr
                             if current_streak > max_streak:
                                 max_streak = current_streak
                         else:
                             current_streak = 0.0
+
+                        # enviar evento ~10x/s com métricas
+                        if ts - last_emit >= 0.1:
+                            ratio = frames_hits / max(1, frames_valid)
+                            self.publish(
+                                "pitch",
+                                f0=float(f0),
+                                hit=bool(hit),
+                                ratio=float(ratio),
+                                valid=int(frames_valid),
+                                streak_s=float(current_streak),
+                            )
+                            last_emit = ts
+
+                        # vitória antecipada?
+                        if frames_valid >= 10:
+                            hit_ratio = frames_hits / max(1, frames_valid)
+                            if hit_ratio >= WIN_THRESHOLD and not self._win_event.is_set():
+                                self._declare_win_now(hit_ratio, max_streak, frames_valid, pitches)
+                                return
                     else:
                         current_streak = 0.0
             except Exception as e:
                 print(_err(f"in_cb error: {e}"))
+                self.publish("error", where="in_cb", message=str(e))
 
         # abrir streams
-
         try:
-            """
-            with sd.OutputStream(
-                samplerate=sr,
-                channels=data.shape[1],
-                device=self._out_dev,
-                callback=out_cb,
-                dtype="float32",
-                finished_callback=lambda: None,
-            ), sd.InputStream(
+            # Somente captura (se quiser tocar o áudio junto, reative OutputStream acima)
+            with sd.InputStream(
                 samplerate=sr,
                 channels=1,
                 device=self._in_dev,
                 callback=in_cb,
                 dtype="float32",
             ):
-                # roda até acabar a música ou pedirem stop
-                while not self._stop_flag.is_set() and self._play_t < len(data):
-                    time.sleep(0.05)
-            """
-            with sd.InputStream(
-                    samplerate=sr,
-                    channels=1,
-                    device=self._in_dev,
-                    callback=in_cb,
-                    dtype="float32",
-            ):
-                # captura só por X segundos ou até stop
                 start_time = time.time()
                 while not self._stop_flag.is_set() and (time.time() - start_time) < self._duration_s:
                     time.sleep(0.05)
-
         finally:
             print(_banner("KARAOKÊ • STREAMS CLOSED"))
+            self.publish("streams_closed")
+
+        if self._win_event.is_set():
+            return
 
         # computa resultado
         if frames_valid > 0:
@@ -426,7 +482,7 @@ class GameEngine:
             achieved = float(np.median(pitches)) if len(pitches) else None
             self._result = SessionResult(
                 state=SessionState.finished,
-                result="ganhou" if hit_ratio >= 0.6 else "perdeu",
+                result="ganhou" if hit_ratio >= WIN_THRESHOLD else "perdeu",
                 hit_ratio=hit_ratio,
                 max_streak_s=float(max_streak),
                 target_hz=float(TARGET_PITCH_HZ),
@@ -465,9 +521,9 @@ class GameEngine:
         print(_kv("frames_valid", f'{d.get("frames_valid")}'))
         print(_kv("duration_s", f'{d.get("duration_s")}'))
         print(_kv("tolerance_hz", f'{d.get("tolerance_hz")}'))
+        self.publish("finished", **d)
 
         print(_banner("JSON"))
-        import json
         print(json.dumps(d, indent=4, ensure_ascii=False))
 
     def _finish_with_error(self, msg: str) -> None:
@@ -485,6 +541,7 @@ class GameEngine:
         )
         self.state = SessionState.finished
         print(_err(f"ERROR: {msg}"))
+        self.publish("finished", **self.result_summary())
 
     # ---------------------- saída pública -----------------------------
     def result_summary(self) -> Dict[str, Any]:
