@@ -16,7 +16,7 @@ from colorama import Fore, Style, init as colorama_init
 #  Versão sem AUBIO: usa LIBROSA (YIN) para detecção de pitch
 #  Requisitos:
 #      pip install librosa sounddevice soundfile colorama numpy
-#  Compatível com Windows + Python 3.10
+#  Compatível com Windows + Python 3.10+
 # ============================================================
 try:
     import librosa  # type: ignore
@@ -26,23 +26,41 @@ except Exception:
 
 colorama_init(autoreset=True)
 
-# ======================= CONFIG PADRÃO DO JOGO =======================
-TARGET_PITCH_HZ = 440        # ~ A4 (padrão)
-TOLERANCE_HZ    = 40.0
-COUNTDOWN_S     = 3          # 3,2,1 e começa
+# ======================= KNOBS (perfil: alto e agudo) =======================
+# Alvo mais agudo por padrão (troque se quiser outra nota)
+TARGET_PITCH_HZ = 330.0      # ~ C4 (Dó4). Ex.: 294 (D4), 330 (E4), 349 (F4), 392 (G4)...
+TOLERANCE_HZ    = 60
+COUNTDOWN_S     = 0
 
-# Faixa típica de voz (ajuste se quiser outro instrumento/voz)
+# Faixa de busca de f0 (mais abrangente)
 FMIN_HZ = 70.0
-FMAX_HZ = 800.0
+FMAX_HZ = 1000.0
 
-# ===== PARÂMETROS DE AVALIAÇÃO RIGOROSA (em cents/segundos) =====
-WIN_RATIO_MIN          = 0.75   # proporção de acertos mínima (antes era 0.6)
-MIN_VOICED_SECONDS     = 2.0    # tempo mínimo de voz válida antes de permitir vitória
-MIN_CONTIG_STREAK_S    = 1.0    # tempo contínuo mínimo "em cima" do alvo
-MAX_JITTER_CENTS       = 35.0   # estabilidade: desvio padrão máx. dos f0 em cents
-MAX_MEDIAN_DEV_CENTS   = 25.0   # quão perto do alvo (mediana) precisa estar
-MIN_RMS                = 0.02   # energia mínima por frame para considerar "voz"
-USE_CENTS_HIT          = True   # usa comparação em cents (recomendado)
+# Critério musical em cents (mais tolerante)
+USE_CENTS_HIT = True
+CENTS_TOL     = 70.0         # antes 30c → agora ±70c (bem mais fácil)
+
+# ===== PARÂMETROS DE AVALIAÇÃO (mais fáceis) =====
+WIN_RATIO_MIN        = 0.55   # antes 0.80
+MIN_VOICED_SECONDS   = 0.05   # antes 0.10
+MIN_CONTIG_STREAK_S  = 0.08   # antes 0.50 (e depois 0.10) → use 0.08 em TODAS as ocorrências
+MAX_JITTER_CENTS     = 60.0   # antes 30.0
+MAX_MEDIAN_DEV_CENTS = 50.0   # antes 20.0
+MIN_RMS              = 0.01   # antes 0.02 (aceita voz mais baixa)
+
+# Piso de "agudo": aceita vozes mais graves
+MIN_REQUIRED_PITCH_HZ = 120.0  # antes 180.0
+
+# --- VITÓRIA POR MICRO-JANELA (mais fácil) ---
+ANY_HIT_MODE          = True
+ANY_HIT_MIN_STREAK_S = 0.40  # ~4 frames (0.093 s * 4)
+MIN_CONTIG_STREAK_S = 0.10
+
+# --- contar "acima da nota" como acerto ---
+COUNT_ABOVE_AS_HIT = True
+# opcional: limite de quanto acima ainda conta (em cents). None = ilimitado
+ABOVE_CENTS_TOL = None  # ou, por ex., 200.0 (≈ 2 semitons)
+
 
 
 # ======================= ESTADO & RESULTADO ==========================
@@ -62,12 +80,12 @@ class SessionResult:
     target_hz: Optional[float] = None
     tolerance_hz: Optional[float] = None
     achieved_pitch_hz: Optional[float] = None
+    max_pitch_hz: Optional[float] = None  # 👈 NOVO
     frames_valid: Optional[int] = None
     duration_s: Optional[float] = None
     error: Optional[str] = None
 
 # ======================= HELPERS DE LOG BONITO =======================
-
 def _hz_to_cents_ratio(f_hz: float, ref_hz: float) -> float:
     """Retorna diferença em cents entre f_hz e ref_hz."""
     if f_hz <= 0 or ref_hz <= 0:
@@ -75,7 +93,7 @@ def _hz_to_cents_ratio(f_hz: float, ref_hz: float) -> float:
     return 1200.0 * np.log2(f_hz / ref_hz)
 
 def _nearest_octave_ref(f_hz: float, target_hz: float) -> float:
-    """Ajusta target para a oitava mais próxima de f_hz (evita dar win só por oitava errada)."""
+    """Ajusta target para a oitava mais próxima de f_hz (evita win em oitava errada)."""
     if f_hz <= 0 or target_hz <= 0:
         return target_hz
     k = round(np.log2(f_hz / target_hz))  # passo em oitavas
@@ -95,17 +113,35 @@ def _rms(block: np.ndarray) -> float:
         return 0.0
     return float(np.sqrt(np.mean(block**2)))
 
-
 def _is_hit(pitch_hz: float, target_hz: float, tol_hz: float) -> bool:
+    if pitch_hz <= 0 or target_hz <= 0:
+        return False
+
+    # hit “normal”: perto do alvo na oitava mais próxima
+    ref_near = _nearest_octave_ref(pitch_hz, target_hz)
+
     if USE_CENTS_HIT:
-        # ~ 40 Hz perto de A4 ≈ 157 cents; vamos usar 35–40c como padrão mais musical
-        return _is_hit_strict_cents(pitch_hz, target_hz, cents_tol=35.0)
-    # legacy em Hz com oitavas:
-    for k in (-2, -1, 0, 1, 2):
-        t = target_hz * (2 ** k)
-        if abs(pitch_hz - t) <= tol_hz:
+        dev_near = _hz_to_cents_ratio(pitch_hz, ref_near)
+        if abs(dev_near) <= CENTS_TOL:
             return True
+
+        # >>> "acima" só conta se for acima do alvo CANÔNICO <<<
+        if COUNT_ABOVE_AS_HIT and pitch_hz >= target_hz:
+            dev_to_base = _hz_to_cents_ratio(pitch_hz, target_hz)
+            if ABOVE_CENTS_TOL is None or 0 <= dev_to_base <= ABOVE_CENTS_TOL:
+                return True
+        return False
+
+    # modo Hz
+    if abs(pitch_hz - ref_near) <= tol_hz:
+        return True
+    if COUNT_ABOVE_AS_HIT and pitch_hz >= target_hz:
+        if ABOVE_CENTS_TOL is None:
+            return True
+        dev_to_base = _hz_to_cents_ratio(pitch_hz, target_hz)
+        return 0 <= dev_to_base <= ABOVE_CENTS_TOL
     return False
+
 
 
 def _banner(title: str) -> str:
@@ -225,6 +261,9 @@ class GameEngine:
         self._win_event = threading.Event()     # vitória antecipada
         self._live_q: "queue.Queue[str]" = queue.Queue(maxsize=1000)  # fila de eventos ao vivo
 
+        # 👇 observers para UI opcional (ex.: /start com janela)
+        self._observers: List["queue.Queue[str]"] = []
+
         # sessão
         self._music_path: Optional[str] = None
         self._audio_data: Optional[np.ndarray] = None
@@ -239,21 +278,69 @@ class GameEngine:
         self._t_start: Optional[float] = None
         self._play_t: int = 0  # ponteiro de reprodução (frames)
 
-        # resultado
+        # resultado / métricas
         self._result: Optional[SessionResult] = None
+        self._metrics: Dict[str, Any] = {}
 
-    # ---------------------- eventos ao vivo (SSE) ---------------------
+    def add_observer(self, q: "queue.Queue[str]") -> None:
+        try:
+            self._observers.append(q)
+        except Exception:
+            pass
+
+    def remove_observer(self, q: "queue.Queue[str]") -> None:
+        try:
+            self._observers = [qq for qq in self._observers if qq is not q]
+        except Exception:
+            pass
+
+    def hard_reset(self) -> None:
+        # sinaliza parada e limpa tudo
+        try:
+            self._stop_flag.set()
+        except Exception:
+            pass
+        try:
+            self._win_event.clear()
+        except Exception:
+            pass
+
+        self._thread = None
+        self._audio_data = None
+        self._sr = None
+        self._duration_s = 0.0
+        self._in_dev = None
+        self._out_dev = None
+        self._t_start = None
+        self._play_t = 0
+        self._result = None
+        self._metrics = {}
+        self.state = SessionState.idle
+        # opcional: limpar observers se quiser garantir que nada fique pendurado
+        # self._observers.clear()
+
+    # ✅ único publish (envia para /live e para observers)
     def publish(self, kind: str, **payload):
-        """Empilha um evento JSON na fila /live."""
+        """Empilha um evento JSON na fila /live e replica para observers."""
         try:
             msg = {"t": time.time(), "kind": kind, **payload}
             s = json.dumps(msg, ensure_ascii=False)
+
             if self._live_q.full():
                 try:
                     self._live_q.get_nowait()  # descarta o mais antigo
                 except Exception:
                     pass
             self._live_q.put_nowait(s)
+
+            # replica para observers (UI local)
+            for qobs in list(self._observers):
+                try:
+                    if qobs.full():
+                        qobs.get_nowait()
+                    qobs.put_nowait(s)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -288,6 +375,7 @@ class GameEngine:
         self._stop_flag.clear()
         self._win_event.clear()
         self._result = None
+        self._metrics = {}
         self._music_path = music_path or "referencia_trecho.wav"  # fallback (relativo ao cwd)
         self._in_dev = in_dev
         self._out_dev = out_dev
@@ -372,13 +460,14 @@ class GameEngine:
 
         self._audio_data = data
         self._sr = int(sr)
+        # duração do trecho de referência (p/ limite de sessão)
         self._duration_s = float(len(data) / sr)
         return candidate, None
 
     # helper: vitória antecipada
-    def _declare_win_now(self, hit_ratio: float, max_streak: float, frames_valid: int,
-                         pitches: List[float]) -> None:
+    def _declare_win_now(self, hit_ratio, max_streak, frames_valid, pitches):
         achieved = float(np.median(pitches)) if len(pitches) else None
+        max_pitch = float(np.max(pitches)) if len(pitches) else None  # 👈 NOVO
         self._result = SessionResult(
             state=SessionState.finished,
             result="ganhou",
@@ -387,13 +476,14 @@ class GameEngine:
             target_hz=float(TARGET_PITCH_HZ),
             tolerance_hz=float(TOLERANCE_HZ),
             achieved_pitch_hz=achieved,
+            max_pitch_hz=max_pitch,  # 👈 NOVO
             frames_valid=int(frames_valid),
             duration_s=float(self._duration_s),
             error=None
         )
-        self.state = SessionState.finished
         self._win_event.set()
         self._stop_flag.set()
+        self.state = SessionState.finished
         self.publish("win", ratio=float(hit_ratio))
 
     def _play_and_measure(self, path: str) -> None:
@@ -431,9 +521,9 @@ class GameEngine:
         dev_cents_samples: List[float] = []
         rms_samples: List[float] = []
 
-        WIN_THRESHOLD = WIN_RATIO_MIN  # critério de vitória
         last_emit = 0.0      # throttling (s)
 
+        # (Opcional) callback de saída — se quiser tocar o áudio pelo sd.Stream duplex
         def out_cb(outdata, frames, time_info, status):
             del time_info
             if status:
@@ -455,6 +545,8 @@ class GameEngine:
                 self.publish("input_status", status=str(status))
 
             nonlocal frames_hits, frames_valid, max_streak, current_streak, pitches, last_emit
+            # CORREÇÃO de escopo — vamos atualizar voiced_seconds dentro do callback
+            nonlocal voiced_seconds
 
             if not HAS_LIBROSA:
                 return
@@ -469,8 +561,14 @@ class GameEngine:
                 for f0 in f0_list:
                     ts = time.time()
 
-                    # Só considera "válido" se há f0 e energia suficiente
-                    if f0 > 0.0 and np.isfinite(f0) and block_rms >= MIN_RMS:
+                    # GATES: precisa ser alto e agudo o suficiente
+                    is_pitch_ok = (f0 > 0.0 and np.isfinite(f0))
+                    is_loud     = block_rms >= MIN_RMS
+                    # dentro do in_cb, antes de calcular is_high:
+                    effective_min_pitch = max(MIN_REQUIRED_PITCH_HZ, TARGET_PITCH_HZ * 0.8)  # ~264 Hz se alvo=330
+                    is_high = (f0 >= effective_min_pitch)
+
+                    if is_pitch_ok and is_loud and is_high:
                         frames_valid += 1
                         pitches.append(float(f0))
 
@@ -480,11 +578,24 @@ class GameEngine:
                         dev_cents_samples.append(dev_cents)
 
                         hit = _is_hit(f0, TARGET_PITCH_HZ, TOLERANCE_HZ)
+                        FRAME_SECONDS = frames / sr  # já existe no fluxo
+                        MICRO_WIN_S = max(ANY_HIT_MIN_STREAK_S, 3 * (4096 / sr))  # garante ≥ 3 frames
+
+                        # ...
                         if hit:
                             frames_hits += 1
                             current_streak += frames / sr
                             if current_streak > max_streak:
                                 max_streak = current_streak
+
+                            # micro-win mais seguro
+                            if (ANY_HIT_MODE
+                                    and current_streak >= ANY_HIT_MIN_STREAK_S
+                                    and frames_valid >= 20):
+                                ratio_now = frames_hits / max(1, frames_valid)
+                                if ratio_now >= WIN_RATIO_MIN:
+                                    self._declare_win_now(ratio_now, max_streak, frames_valid, pitches)
+                                    return
                         else:
                             current_streak = 0.0
 
@@ -503,44 +614,46 @@ class GameEngine:
                                 streak_s=float(current_streak),
                                 rms=float(block_rms),
                                 dev_cents=float(dev_cents),
+                                loud=bool(is_loud),
+                                high=bool(is_high),
                             )
                             last_emit = ts
 
-                        # vitória antecipada MAIS RÍGIDA
-                        if frames_valid >= 20:  # requer ao menos alguns frames válidos
+                        # vitória antecipada (mesma lógica do final)
+                        if frames_valid >= 20:
                             ratio_now = frames_hits / max(1, frames_valid)
                             jitter = float(np.std(dev_cents_samples)) if len(dev_cents_samples) > 1 else 999.0
                             median_dev = float(np.median(np.abs(dev_cents_samples))) if dev_cents_samples else 999.0
 
                             if (
-                                    ratio_now >= WIN_RATIO_MIN and
-                                    voiced_seconds >= MIN_VOICED_SECONDS and
-                                    max_streak >= MIN_CONTIG_STREAK_S and
-                                    jitter <= MAX_JITTER_CENTS and
-                                    median_dev <= MAX_MEDIAN_DEV_CENTS and
-                                    not self._win_event.is_set()
+                                ratio_now >= WIN_RATIO_MIN and
+                                voiced_seconds >= MIN_VOICED_SECONDS and
+                                max_streak >= MIN_CONTIG_STREAK_S and
+                                jitter <= MAX_JITTER_CENTS and
+                                median_dev <= MAX_MEDIAN_DEV_CENTS and
+                                not self._win_event.is_set()
                             ):
                                 self._declare_win_now(ratio_now, max_streak, frames_valid, pitches)
                                 return
                     else:
+                        # falhou em loud/high/pitch válido: zera sequência
                         current_streak = 0.0
 
             except Exception as e:
                 print(_err(f"in_cb error: {e}"))
                 self.publish("error", where="in_cb", message=str(e))
 
-        # abrir streams
+        # abrir apenas InputStream (medição); se quiser tocar referência, use sd.Stream e passe out_cb
         try:
             with sd.InputStream(
-                    samplerate=sr,
-                    channels=1,
-                    device=self._in_dev,
-                    callback=in_cb,
-                    dtype="float32",
-                    blocksize=blocksize,  # <= usa o mesmo blocksize do processamento (4096)
-                    latency="high",  # dá mais folga para CPU/driver; teste "low" depois
+                samplerate=sr,
+                channels=1,
+                device=self._in_dev,
+                callback=in_cb,
+                dtype="float32",
+                blocksize=blocksize,  # usa o mesmo blocksize do processamento (4096)
+                latency="high",       # dá mais folga para CPU/driver; teste "low" depois
             ):
-
                 start_time = time.time()
                 while not self._stop_flag.is_set() and (time.time() - start_time) < self._duration_s:
                     time.sleep(0.05)
@@ -555,30 +668,11 @@ class GameEngine:
         if frames_valid > 0:
             hit_ratio = float(frames_hits / frames_valid)
             achieved = float(np.median(pitches)) if len(pitches) else None
+            max_pitch = float(np.max(pitches)) if len(pitches) else None  # 👈 NOVO
             rms_mean = float(np.mean(rms_samples)) if rms_samples else 0.0
             rms_median = float(np.median(rms_samples)) if rms_samples else 0.0
             jitter_cents = float(np.std(dev_cents_samples)) if len(dev_cents_samples) > 1 else None
             median_dev_cents = float(np.median(np.abs(dev_cents_samples))) if dev_cents_samples else None
-            self._metrics: Dict[str, Any] = {}
-
-            self._result = SessionResult(
-                state=SessionState.finished,
-                result="ganhou" if (
-                        hit_ratio >= WIN_RATIO_MIN and
-                        voiced_seconds >= MIN_VOICED_SECONDS and
-                        max_streak >= MIN_CONTIG_STREAK_S and
-                        (jitter_cents is not None and jitter_cents <= MAX_JITTER_CENTS) and
-                        (median_dev_cents is not None and median_dev_cents <= MAX_MEDIAN_DEV_CENTS)
-                ) else "perdeu",
-                hit_ratio=hit_ratio,
-                max_streak_s=float(max_streak),
-                target_hz=float(TARGET_PITCH_HZ),
-                tolerance_hz=float(TOLERANCE_HZ),
-                achieved_pitch_hz=achieved,
-                frames_valid=int(frames_valid),
-                duration_s=float(self._duration_s),
-                error=None
-            )
             self._metrics = {
                 "voiced_seconds": float(voiced_seconds),
                 "rms_mean": rms_mean,
@@ -587,12 +681,41 @@ class GameEngine:
                 "median_dev_cents": median_dev_cents,
             }
 
-            # Envie no publish final também
-            self.publish("stats",
-                         rms_mean=rms_mean, rms_median=rms_median,
-                         jitter_cents=jitter_cents, median_dev_cents=median_dev_cents,
-                         voiced_seconds=float(voiced_seconds)
-                         )
+            # --- critério padrão (rigoroso) ---
+            metrica_rigorosa = (
+                hit_ratio >= WIN_RATIO_MIN and
+                voiced_seconds >= MIN_VOICED_SECONDS and
+                max_streak >= MIN_CONTIG_STREAK_S and
+                (jitter_cents is not None and jitter_cents <= MAX_JITTER_CENTS) and
+                (median_dev_cents is not None and median_dev_cents <= MAX_MEDIAN_DEV_CENTS)
+            )
+
+            # --- critério micro-janela (encostou por ANY_HIT_MIN_STREAK_S) ---
+            metrica_microjanela = (ANY_HIT_MODE and max_streak >= ANY_HIT_MIN_STREAK_S)
+
+            result_flag = (metrica_rigorosa or metrica_microjanela)
+
+            self._result = SessionResult(
+                state=SessionState.finished,
+                result="ganhou" if result_flag else "perdeu",
+                hit_ratio=hit_ratio,
+                max_streak_s=float(max_streak),
+                target_hz=float(TARGET_PITCH_HZ),
+                tolerance_hz=float(TOLERANCE_HZ),
+                achieved_pitch_hz=achieved,
+                max_pitch_hz=max_pitch,  # 👈 NOVO
+                frames_valid=int(frames_valid),
+                duration_s=float(self._duration_s),
+                error=None
+            )
+
+            # publica alguns stats úteis
+            self.publish(
+                "stats",
+                rms_mean=rms_mean, rms_median=rms_median,
+                jitter_cents=jitter_cents, median_dev_cents=median_dev_cents,
+                voiced_seconds=float(voiced_seconds)
+            )
         else:
             # nenhum frame válido: gera resultado “perdeu” com erro descritivo
             self._result = SessionResult(
@@ -603,11 +726,12 @@ class GameEngine:
                 target_hz=float(TARGET_PITCH_HZ),
                 tolerance_hz=float(TOLERANCE_HZ),
                 achieved_pitch_hz=None,
+                max_pitch_hz=None,  # 👈 NOVO
                 frames_valid=0,
                 duration_s=float(self._duration_s),
                 error=("librosa não instalado; sem medição"
                        if not HAS_LIBROSA else
-                       "sem medições válidas (rms baixo/ruído/overflow ou sem voz detectada)")
+                       "sem medições válidas (rms baixo/ruído/overflow/nota abaixo do piso)")
             )
             self._metrics = {
                 "voiced_seconds": 0.0,
@@ -630,7 +754,6 @@ class GameEngine:
         print(_kv("frames_valid", f'{d.get("frames_valid")}'))
         print(_kv("duration_s", f'{d.get("duration_s")}'))
         print(_kv("tolerance_hz", f'{d.get("tolerance_hz")}'))
-        # se você adicionou ao summary, printe-os:
         print(_kv("voiced_seconds", f'{d.get("voiced_seconds", "—")}'))
         print(_kv("rms_mean", f'{d.get("rms_mean", "—")}'))
         print(_kv("rms_median", f'{d.get("rms_median", "—")}'))
@@ -665,17 +788,15 @@ class GameEngine:
             return {"state": self.state.value, "error": "Sem resultado"}
         d = asdict(self._result)
 
-        d["state"] = self._result.state.value if isinstance(self._result.state, SessionState) else str(
-            self._result.state)
-        for k in ("target_hz", "tolerance_hz", "achieved_pitch_hz", "hit_ratio", "max_streak_s", "duration_s"):
+        d["state"] = self._result.state.value if isinstance(self._result.state, SessionState) else str(self._result.state)
+        for k in ("target_hz", "tolerance_hz", "achieved_pitch_hz","max_pitch_hz", "hit_ratio", "max_streak_s", "duration_s"):
             if d.get(k) is not None:
                 d[k] = float(d[k])
         if d.get("frames_valid") is not None:
             d["frames_valid"] = int(d["frames_valid"])
 
-        # 👇 inclui métricas extras para o _finalize_and_print e para o /result
+        # inclui métricas extras
         if hasattr(self, "_metrics") and isinstance(self._metrics, dict):
             d.update(self._metrics)
 
         return d
-
