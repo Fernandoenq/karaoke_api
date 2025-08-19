@@ -1,3 +1,5 @@
+#game_logic.py
+
 import os
 import time
 import threading
@@ -161,32 +163,105 @@ def _err(msg: str) -> str:
     return f"{Fore.RED}{msg}{Style.RESET_ALL}"
 
 # ======================= DISPOSITIVOS ================================
-def list_audio_devices() -> Dict[str, Any]:
-    """Retorna devices de áudio (entrada/saída) em tipos nativos."""
+def list_audio_devices(simple: bool = True) -> Dict[str, Any]:
     info = sd.query_devices()
     defaults = sd.default.device  # [in, out]
-    inputs: List[Dict[str, Any]] = []
-    outputs: List[Dict[str, Any]] = []
+    hostapis = sd.query_hostapis()
 
-    for idx, dev in enumerate(info):
-        rec = dict(
-            id=int(idx),
-            name=str(dev.get("name", "")),
-            max_input_channels=int(dev.get("max_input_channels", 0)),
-            max_output_channels=int(dev.get("max_output_channels", 0)),
-        )
-        if rec["max_input_channels"] > 0:
-            inputs.append(rec)
-        if rec["max_output_channels"] > 0:
-            outputs.append(rec)
+    def hostapi_name(idx: int) -> str:
+        try:
+            return hostapis[idx]["name"]
+        except Exception:
+            return "unknown"
 
-    def _as_int(x):
+    def as_int(x):
         try:
             return int(x) if x is not None else None
         except Exception:
             return None
 
-    return {"defaults": [_as_int(defaults[0]), _as_int(defaults[1])], "input": inputs, "output": outputs}
+    raw_inputs, raw_outputs = [], []
+    for idx, dev in enumerate(info):
+        rec = dict(
+            id=int(idx),
+            name=str(dev.get("name", "")),
+            hostapi=str(hostapi_name(int(dev.get("hostapi", 0)))),
+            max_input_channels=int(dev.get("max_input_channels", 0)),
+            max_output_channels=int(dev.get("max_output_channels", 0)),
+        )
+        # flags úteis:
+        nlow = rec["name"].lower()
+        rec["is_bluetooth"] = ("bth" in nlow) or ("hands-free" in nlow) or ("arcbuds" in nlow)
+        rec["is_virtual"] = any(x in nlow for x in ["mixagem estéreo", "stereo mix", "elgato", "virtual"])
+        rec["is_mapper"] = "mapeador" in nlow or "mapper" in nlow or "driver de som primário" in nlow or "driver de captura" in nlow
+        rec["quality_hint"] = (
+            "low" if rec["is_bluetooth"] and "hands-free" in nlow
+            else "virtual" if rec["is_virtual"]
+            else "good" if rec["hostapi"].startswith("Windows WASAPI")
+            else "ok"
+        )
+
+        if rec["max_input_channels"] > 0:
+            raw_inputs.append(rec)
+        if rec["max_output_channels"] > 0:
+            raw_outputs.append(rec)
+
+    if not simple:
+        return {
+            "defaults": [as_int(defaults[0]), as_int(defaults[1])],
+            "input": raw_inputs,
+            "output": raw_outputs,
+        }
+
+    # --- modo simples: filtra mapeadores e agrupa duplicatas por “nome base” ---
+    def base_key(name: str) -> str:
+        # normaliza pequenas diferenças
+        return (
+            name.replace("  ", " ")
+                .replace("  ", " ")
+                .replace("  ", " ")
+                .strip()
+                .lower()
+        )
+
+    def pick_best(devs: List[Dict[str, Any]], want_input: bool) -> Dict[str, Any]:
+        # prioridade: WASAPI > WDM-KS > DirectSound > MME; evita Hands-Free; evita “virtual”
+        order = {"windows wasapi": 4, "windows wdm-ks": 3, "windows directsound": 2, "mme": 1}
+        def score(d):
+            api = d["hostapi"].lower()
+            return (
+                (order.get(api, 0)) * 1000
+                - (500 if (d["is_bluetooth"] and "hands-free" in d["name"].lower()) else 0)
+                - (200 if d["is_virtual"] else 0)
+                + (d["max_input_channels"] if want_input else d["max_output_channels"])
+            )
+        # tira mapeadores
+        cands = [d for d in devs if not d["is_mapper"]]
+        if not cands:
+            cands = devs
+        return sorted(cands, key=score, reverse=True)[0]
+
+    def dedupe(devs: List[Dict[str, Any]], want_input: bool) -> List[Dict[str, Any]]:
+        groups = {}
+        for d in devs:
+            if d["is_mapper"]:
+                continue
+            key = base_key(d["name"])
+            groups.setdefault(key, []).append(d)
+        chosen = [pick_best(v, want_input) for v in groups.values()]
+        # ordena por nome para ficar estável
+        chosen.sort(key=lambda d: d["name"].lower())
+        return chosen
+
+    inputs_s = dedupe(raw_inputs, want_input=True)
+    outputs_s = dedupe(raw_outputs, want_input=False)
+
+    return {
+        "defaults": [as_int(defaults[0]), as_int(defaults[1])],
+        "input": inputs_s,
+        "output": outputs_s,
+    }
+
 
 # ======================= DETECTOR DE PITCH (LIBROSA) =================
 class LibrosaPitchDetector:

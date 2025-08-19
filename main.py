@@ -8,11 +8,11 @@ import asyncio
 import json
 import threading
 import os
+import sounddevice as sd
 
 from .game_logic import GameEngine, SessionState, list_audio_devices
-from .start_ui import open_start_ui          # opcional: janela de sessão (/start)
-from .realtime_ui import launch_realtime_ui  # opcional: janela de análise em tempo real (/teste)
-
+from .start_ui import open_start_ui          # opcional
+from .realtime_ui import launch_realtime_ui  # opcional
 
 
 app = FastAPI(title="Karaokê API", version="1.0.0")
@@ -20,73 +20,111 @@ app = FastAPI(title="Karaokê API", version="1.0.0")
 # CORS básico (libere domínios específicos em produção)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ajuste para o(s) host(s) do seu front
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 engine = GameEngine()
-
-# Lock para serializar /start e evitar corridas
 START_LOCK = asyncio.Lock()
 
-# ====== MODELOS Pydantic (somente tipos nativos) ======
+
+# ---------------------- helpers ----------------------
+def resolve_device_id(name_substr: str, want_input=True):
+    """Resolve ID de dispositivo pelo nome (substring), priorizando WASAPI."""
+    name_substr = name_substr.lower()
+    devs = sd.query_devices()
+    hostapis = sd.query_hostapis()
+
+    def hostapi_name(i):
+        try:
+            return hostapis[i]["name"].lower()
+        except Exception:
+            return ""
+
+    cands = []
+    for idx, d in enumerate(devs):
+        has_ch = (d['max_input_channels'] if want_input else d['max_output_channels']) > 0
+        if has_ch and name_substr in d['name'].lower():
+            cands.append({
+                "id": idx,
+                "hostapi": hostapi_name(d["hostapi"]),
+                "name": d["name"]
+            })
+
+    order = {"windows wasapi": 4, "windows wdm-ks": 3, "windows directsound": 2, "mme": 1}
+    cands.sort(key=lambda c: order.get(c["hostapi"], 0), reverse=True)
+
+    for c in cands:
+        try:
+            if want_input:
+                sd.check_input_settings(device=c["id"], samplerate=44100, channels=1)
+            else:
+                sd.check_output_settings(device=c["id"], samplerate=44100, channels=2)
+            return c["id"]
+        except Exception:
+            continue
+    return None
+# -----------------------------------------------------
+
+
+# ====== MODELOS Pydantic ======
 class StatusResponse(BaseModel):
     state: str
     countdown: Optional[int] = None
     progress: float = 0.0
     message: str = ""
 
+
 class ResultResponse(BaseModel):
     state: str
-    result: Optional[str] = None          # "ganhou" | "perdeu"
+    result: Optional[str] = None
     hit_ratio: Optional[float] = None
     max_streak_s: Optional[float] = None
     target_hz: Optional[float] = None
     tolerance_hz: Optional[float] = None
     achieved_pitch_hz: Optional[float] = None
-    max_pitch_hz: Optional[float] = None  # 👈 NOVO: maior f0 válido alcançado
+    max_pitch_hz: Optional[float] = None
     frames_valid: Optional[int] = None
     duration_s: Optional[float] = None
     error: Optional[str] = None
-    # métricas extras que o engine pode anexar:
     voiced_seconds: Optional[float] = None
     rms_mean: Optional[float] = None
     rms_median: Optional[float] = None
     jitter_cents: Optional[float] = None
     median_dev_cents: Optional[float] = None
 
-# Para o /start retornar 202 (status) ou 200 (vitória) com payloads diferentes
+
 StartResponse = Union[StatusResponse, ResultResponse]
+
 
 # ====== HOME ======
 @app.get("/")
 def home():
     return {"ok": True, "service": "karaoke_api", "docs": "/docs"}
 
+
 # ====== DEVICES ======
 @app.get("/audio/devices")
 def audio_devices():
     return list_audio_devices()
 
-# ====== SSE: eventos ao vivo ======
+
+# ====== SSE: eventos ======
 @app.get("/live")
 def live():
-    """SSE com eventos ao vivo do engine (countdown, pitch, win, finished...)."""
     def event_gen():
-        # dica de reconexão automática do navegador
         yield "retry: 500\n\n"
         while True:
             try:
-                s = engine._live_q.get(timeout=1.0)  # string JSON
+                s = engine._live_q.get(timeout=1.0)
                 yield f"data: {s}\n\n"
             except Exception:
-                # keep-alive para não fechar a conexão
                 yield "event: ping\ndata: {}\n\n"
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
-# ====== START ======
+
 # ====== START ======
 @app.post("/start", response_model=StartResponse, status_code=202)
 async def start(
@@ -96,27 +134,30 @@ async def start(
     in_dev: Optional[int] = Query(None),
     out_dev: Optional[int] = Query(None),
     wait_on_win: bool = Query(True),
-    # 👇 opcional (não quebra contrato): só liga UI se você pedir
-    with_ui: Optional[int] = Query(None, description="1 para abrir UI local"),
+    in_name: Optional[str] = Query(None),
+    out_name: Optional[str] = Query(None),
+    with_ui: Optional[int] = Query(None),
 ):
     async with START_LOCK:
-        # --- Pré-empt: encerra qualquer sessão antiga antes de iniciar outra ---
+        # encerra sessão antiga
         if engine.state not in (SessionState.idle, SessionState.finished):
-            engine.stop()  # tentativa graciosa
-            # aguarda até 3s pelo término (em steps de 100ms)
+            engine.stop()
             for _ in range(30):
                 if engine.state == SessionState.finished:
                     break
                 await asyncio.sleep(0.1)
-            # se ainda não terminou, força reset e dá folga p/ soltar dispositivos
             if engine.state != SessionState.finished:
                 engine.hard_reset()
                 await asyncio.sleep(0.1)
 
-        # --- Prepara e inicia nova sessão ---
+        # resolve nomes se foi passado
+        if in_name and in_dev is None:
+            in_dev = resolve_device_id(in_name, want_input=True)
+        if out_name and out_dev is None:
+            out_dev = resolve_device_id(out_name, want_input=False)
+
         engine.prepare(music_path=music_path, in_dev=in_dev, out_dev=out_dev)
 
-        # se pediu UI, registra e semeia estado atual (abre só uma vez)
         if (with_ui == 1) or (os.environ.get("DEBUG_START_UI") == "1"):
             open_start_ui(engine)
             engine.publish(
@@ -127,10 +168,8 @@ async def start(
                 music=music_path or "referencia_trecho.wav",
             )
 
-        # inicia a thread da sessão
         threading.Thread(target=engine.run_session_async, daemon=True).start()
 
-        # retorno imediato se não quiser aguardar vitória
         if not wait_on_win:
             return StatusResponse(
                 state=engine.state.value,
@@ -139,35 +178,30 @@ async def start(
                 message="Sessão iniciada",
             )
 
-        # --- Aguarda vitória antecipada ou término ---
         timeout_s = 5 * 60
         tick = 0.1
         waited = 0.0
         while waited < timeout_s:
-            # vitória antecipada durante a sessão
             if engine._win_event.is_set():
                 d = engine.result_summary()
                 response.status_code = 200
                 return ResultResponse(**d)
 
-            # sessão terminou: avalia resultado final
             if engine.state == SessionState.finished:
                 d = engine.result_summary()
                 if d.get("result") == "ganhou":
-                    response.status_code = 200  # vitória ao finalizar
+                    response.status_code = 200
                     return ResultResponse(**d)
-                # terminou sem vitória → mantém 202
                 return StatusResponse(
                     state=engine.state.value,
                     countdown=engine.countdown_left(),
                     progress=engine.progress(),
-                    message="Sessão finalizada (sem vitória antecipada)",
+                    message="Sessão finalizada (sem vitória)",
                 )
 
             await asyncio.sleep(tick)
             waited += tick
 
-        # timeout: sessão pode seguir rodando; front deve consultar /result
         return StatusResponse(
             state=engine.state.value,
             countdown=engine.countdown_left(),
@@ -176,7 +210,7 @@ async def start(
         )
 
 
-# STOP com modo força
+# ====== STOP ======
 @app.post("/stop", response_model=StatusResponse)
 def stop(force: bool = Query(False)):
     if force:
@@ -195,21 +229,24 @@ def stop(force: bool = Query(False)):
         message="Sessão interrompida"
     )
 
-# RESET administrativo (sempre força idle)
+
+# ====== RESET ======
 @app.post("/admin/reset")
 def admin_reset():
     engine.hard_reset()
     return {"ok": True, "state": engine.state.value}
+
 
 # ====== STATUS ======
 @app.get("/status", response_model=StatusResponse)
 def status():
     return StatusResponse(
         state=engine.state.value,
-        countdown=engine.countown_left() if hasattr(engine, "countown_left") else engine.countdown_left(),
+        countdown=engine.countdown_left(),
         progress=engine.progress(),
         message=engine.status_message(),
     )
+
 
 # ====== RESULT ======
 @app.get("/result", response_model=ResultResponse)
@@ -218,18 +255,14 @@ def result():
         raise HTTPException(409, "A sessão ainda não terminou.")
     return ResultResponse(**engine.result_summary())
 
-# ====== TESTE (abre UI de análise em tempo real) ======
+
+# ====== TESTE ======
 @app.post("/teste", response_model=StatusResponse, status_code=202)
 def teste(
-    in_dev: Optional[int] = Query(None, description="ID do dispositivo de entrada (veja /audio/devices)"),
-    sr: int = Query(44100, description="Sample rate"),
-    blocksize: int = Query(2048, description="Tamanho do bloco em amostras"),
+    in_dev: Optional[int] = Query(None),
+    sr: int = Query(44100),
+    blocksize: int = Query(2048),
 ):
-    """
-    Abre uma janela simples (Tkinter) mostrando a análise em tempo real do microfone.
-    Fecha a janela => encerra a captura. A API continua disponível.
-    """
-    # dispara a UI em thread separada
     threading.Thread(
         target=launch_realtime_ui,
         args=(in_dev, sr, blocksize),
