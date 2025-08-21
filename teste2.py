@@ -18,10 +18,11 @@ TARGETS = {
     "loudness_dbfs": -20.0,
     "snr_db": 10.0,
     "centroid_hz": 2000.0,
-    "rolloff85_hz": 4000.0,
+    "rolloff85_hz": 7000.0,
     "zcr": 0.15,
 }
-
+#fala=True] Pitch=343.04 Hz (D4) | Loudness=-11.15 dBFS | SNR=47.0 dB | Centroid=2091.5 Hz | Rolloff(85%)=5277 Hz | ZCR=0.232 | Sal=32.1 dB
+#METAS [OK] -> pitch_hz: ✓(343.04 ≥ 120) | loudness_dbfs: ✓(-11.15 ≥ -20.0) | snr_db: ✓(47.01 ≥ 10.0) | centroid_hz: ✓(2091.54 ≥ 2000.0) | rolloff85_hz: ✓(5277.34 ≥ 5000.0) | zcr: ✓(0.23 ≥ 0.15)
 # ===================== Config de áudio =====================
 SR = 16_000
 CHANNELS = 1
