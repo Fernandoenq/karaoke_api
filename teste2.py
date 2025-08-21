@@ -15,10 +15,10 @@ from fastapi.middleware.cors import CORSMiddleware
 # ===================== Metas (atingiu OU ultrapassou) =====================
 TARGETS = {
     "pitch_hz": 120,
-    "loudness_dbfs": -35.0,
+    "loudness_dbfs": -20.0,
     "snr_db": 10.0,
-    "centroid_hz": 1200.0,
-    "rolloff85_hz": 3000.0,
+    "centroid_hz": 2000.0,
+    "rolloff85_hz": 4000.0,
     "zcr": 0.15,
 }
 
@@ -32,10 +32,10 @@ BASELINE_SEC = 1.0
 EPS = 1e-12
 
 # ======= GATES contra falsos positivos =======
-LOUDNESS_FLOOR_DBFS = -50.0
-MIN_SNR_DB = 14.0
+LOUDNESS_FLOOR_DBFS = -45.0
+MIN_SNR_DB = 24.0
 MAX_NOISE_ZCR = 0.15
-VAD_FACTOR = 2.0
+VAD_FACTOR = 3.0
 
 # ===================== Estado global =====================
 _worker_thread: Optional[threading.Thread] = None
