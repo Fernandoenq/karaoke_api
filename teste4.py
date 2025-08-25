@@ -18,8 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 # - tuning_score: quanto "sobrou" dentro da tolerância (em cents). Quanto MAIOR, melhor.
 #   Ex.: tolerância 20c; se erro=7c -> score=13; se erro=21c -> score=0.
 TARGETS = {
-    "pitch_hz": 120.0,        # pelo menos um pitch acima deste valor
-    "tuning_score": 16.0,     # exige boa afinação (com TOL=20c, erro ≤ 4c)
+    "pitch_hz": 90.0,        # pelo menos um pitch acima deste valor
+    "tuning_score": 12.0,     # exige boa afinação (com TOL=20c, erro ≤ 4c)
 }
 
 # Parâmetros de afinação
@@ -35,7 +35,7 @@ BASELINE_SEC = 1.0
 EPS = 1e-12
 
 # ======= GATES contra falsos positivos =======
-LOUDNESS_FLOOR_DBFS = -40.0     # descarta blocos muito fracos
+LOUDNESS_FLOOR_DBFS = -40.0     # altura da voz
 MIN_SNR_DB = 30.0               # exige ambiente relativamente limpo
 MAX_NOISE_ZCR = 0.15
 VAD_FACTOR = 3.5
@@ -71,6 +71,12 @@ _audio_q: Queue[np.ndarray] = Queue(maxsize=256)
 # ===================== Utilitários musicais =====================
 A4_HZ = 440.0
 SEMITONE_LOG2 = 1.0 / 12.0
+
+def rms_dbfs(x: np.ndarray):
+    rms = float(np.sqrt(np.mean(x**2) + EPS))  # Calcula o RMS (Root Mean Square)
+    db = 20.0 * np.log10(rms + EPS)  # Converte RMS para dBFS
+    return rms, db
+
 
 def _hz_to_note_name_stub(f0: float) -> str:
     if not f0 or f0 <= 0:
@@ -126,7 +132,6 @@ def estimate_pitch_fft(x: np.ndarray, sr_hz: int, fmin=70.0, fmax=500.0) -> floa
     else:
         f0 = freqs[k_global]
     return float(f0)
-
 def spectral_features(x: np.ndarray, sr_hz: int):
     """Mantido por causa do gate de ruído via ZCR."""
     n = int(2 ** np.ceil(np.log2(len(x))))
@@ -141,6 +146,7 @@ def spectral_features(x: np.ndarray, sr_hz: int):
     zc = np.where(np.diff(np.signbit(x)))[0]
     zcr = float(len(zc) / max(len(x)-1, 1))
     return centroid, rolloff, zcr
+
 
 def rms_dbfs(x: np.ndarray):
     rms = float(np.sqrt(np.mean(x**2) + EPS))
@@ -437,17 +443,6 @@ def start_analysis(device: Optional[int | str] = None):
 
     # Loop de espera: vitória ou stop
     while True:
-        if _win_event.is_set():
-            snap = _snapshot_for_response()
-            return {
-                "ok": True,
-                "status": "parabens",
-                "message": "Parabéns! Você afinou dentro da meta.",
-                "metrics": snap["win_metrics"],
-                "checks": snap["win_checks"],
-                "targets": snap["targets"],
-                "tuning_tolerance_cents": snap["tuning_tolerance_cents"],
-            }
         if _stop_event.is_set():
             # Stop antes de ganhar
             snap = _snapshot_for_response()
