@@ -17,6 +17,8 @@ TARGETS = {
     #seria a nota
     "pitch_hz": 90.0, #nv1=90.0, nv2=110.0, nv3=130.0, nv4=150.0, nv5=180.0, nv6=210.0, nv7=250.0   
     "tuning_score": 14.0, #nv1=12.0, nv2=14.0, nv3=15.0, nv4=16.0, nv5=17.0, nv6=18.0, nv7=19.0
+    #"loudness_dbfs": -15.0,        # média razoável
+    "loudness_dbfs_peak": -10.0,    # e um pico forte
 }
 
 TUNING_TOLERANCE_CENTS = 18.0   #nv1=20.0, nv2=18.0, nv3=16.0, nv4=14.0, nv5=12.0, nv6=10.0, nv7=8.0
