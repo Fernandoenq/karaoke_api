@@ -13,17 +13,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # ===================== Metas (foco em PITCH e AFINAÇÃO) =====================
-# Regras: valor medido >= alvo => OK
-# - pitch_hz: garante que há voz com pitch "suficiente" (ex.: >=120Hz)
-# - tuning_score: quanto "sobrou" dentro da tolerância (em cents). Quanto MAIOR, melhor.
-#   Ex.: tolerância 20c; se erro=7c -> score=13; se erro=21c -> score=0.
 TARGETS = {
-    "pitch_hz": 90.0,        # pelo menos um pitch acima deste valor
-    "tuning_score": 12.0,     # exige boa afinação (com TOL=20c, erro ≤ 4c)
+    #seria a nota
+    "pitch_hz": 90.0, #nv1=90.0, nv2=110.0, nv3=130.0, nv4=150.0, nv5=180.0, nv6=210.0, nv7=250.0   
+    "tuning_score": 14.0, #nv1=12.0, nv2=14.0, nv3=15.0, nv4=16.0, nv5=17.0, nv6=18.0, nv7=19.0
 }
 
-# Parâmetros de afinação
-TUNING_TOLERANCE_CENTS = 20.0   # tolerância para considerar "afinou" (±20 cents)
+TUNING_TOLERANCE_CENTS = 18.0   #nv1=20.0, nv2=18.0, nv3=16.0, nv4=14.0, nv5=12.0, nv6=10.0, nv7=8.0
 
 # ===================== Config de áudio =====================
 SR = 16_000
@@ -35,15 +31,17 @@ BASELINE_SEC = 1.0
 EPS = 1e-12
 
 # ======= GATES contra falsos positivos =======
-LOUDNESS_FLOOR_DBFS = -40.0     # altura da voz
-MIN_SNR_DB = 30.0               # exige ambiente relativamente limpo
+#LOUDNESS_FLOOR_DBFS nv1 = -45.0, nv2 = -42.0, nv3 = -40.0, nv4 = -38.0, nv5 = -36.0, nv6 = -34.0, nv7 = -32.0
+LOUDNESS_FLOOR_DBFS = -42.0  #0 é o máximo, quanto mais perto do 0, mais alto deve cantar
+# mede a clareza do som da voz em relação ao ruído de fundo.
+MIN_SNR_DB = 24.0   #nv1=24.0, nv2=28.0, nv3=32.0, nv4=36.0, nv5=48.0, nv6=52.0, nv7=60.0            
 MAX_NOISE_ZCR = 0.15
-VAD_FACTOR = 3.5
-SALIENCE_MIN_DB = 14.0          # mais exigente que 10 dB (evita pitch "fantasma")
+VAD_FACTOR = 3.0
+SALIENCE_MIN_DB = 14.0          
 
 # ======= VITÓRIA: exigir estabilidade (streak) =======
-# Com HOP_MS=250ms, 8 janelas ≈ 2s de estabilidade.
-WIN_STREAK = 1
+#Mudar isso a pessoa tem que se manter no ok por janelas consecutivasß
+WIN_STREAK = 1 #nv1=1, nv2=2, nv3=3, nv4=4, nv5=5, nv6=6, nv7=7 
 
 # ===================== Estado global =====================
 _worker_thread: Optional[threading.Thread] = None
