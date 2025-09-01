@@ -1,4 +1,3 @@
-# app.py
 from __future__ import annotations
 
 import threading
@@ -61,6 +60,14 @@ _last_line: Optional[str] = None
 _has_won = False
 _win_metrics: Optional[dict] = None
 _win_checks: Optional[dict] = None
+
+_last_valid_metrics: Optional[dict] = None
+_last_valid_checks: Optional[dict] = None
+_last_valid_line: Optional[str] = None
+
+# <<< NOVO: Rastrear a melhor tentativa da sessão
+_best_metrics_so_far: Optional[dict] = None
+_best_checks_so_far: Optional[dict] = None
 
 # >>> Novo: pico de loudness da sessão
 _max_loudness_dbfs: Optional[float] = None  # atualizado ao longo da sessão
@@ -191,7 +198,7 @@ def _audio_callback(indata, frames, time_info, status):
 
 # ===================== Loop de análise (worker) =====================
 def analysis_loop(device: Optional[int | str] = None):
-    global _is_running, _last_metrics, _last_checks, _last_line, _has_won, _win_metrics, _win_checks, _max_loudness_dbfs
+    global _is_running, _last_metrics, _last_checks, _last_line, _has_won, _win_metrics, _win_checks, _max_loudness_dbfs, _best_metrics_so_far, _best_checks_so_far
 
     block_samples = max(1, int(SR * (BLOCK_MS / 1000.0)))
     window_samples = max(block_samples, int(SR * (WINDOW_MS / 1000.0)))
@@ -287,7 +294,7 @@ def analysis_loop(device: Optional[int | str] = None):
                         "tuning_error_cents": None,
                         "tuning_score": None,
                         "loudness_dbfs": float(dbfs),
-                        "loudness_dbfs_peak": None if _max_loudness_dbfs is None else float(_max_loudness_dbfs),  # <<<
+                        "loudness_dbfs_peak": None if _max_loudness_dbfs is None else float(_max_loudness_dbfs),
                     }
                     _last_checks = None
                     _last_line = (
@@ -305,7 +312,7 @@ def analysis_loop(device: Optional[int | str] = None):
                         "tuning_error_cents": None,
                         "tuning_score": None,
                         "loudness_dbfs": float(dbfs),
-                        "loudness_dbfs_peak": None if _max_loudness_dbfs is None else float(_max_loudness_dbfs),  # <<<
+                        "loudness_dbfs_peak": None if _max_loudness_dbfs is None else float(_max_loudness_dbfs),
                     }
                     _last_checks = None
                     _last_line = f"[skip] salience={sal_db:.1f} dB"
@@ -323,9 +330,28 @@ def analysis_loop(device: Optional[int | str] = None):
                     "tuning_error_cents": None if err_cents is None else float(err_cents),
                     "tuning_score": None if tune_score is None else float(tune_score),
                     "loudness_dbfs": float(dbfs),
-                    "loudness_dbfs_peak": None if _max_loudness_dbfs is None else float(_max_loudness_dbfs),  # <<<
+                    "loudness_dbfs_peak": None if _max_loudness_dbfs is None else float(_max_loudness_dbfs),
                 }
             checks = eval_goals(metrics)
+
+            # <<< NOVO: RASTREAR A MELHOR TENTATIVA (BEST SO FAR)
+            is_valid_attempt = metrics.get("pitch_hz") is not None or metrics.get("tuning_score") is not None
+            if is_valid_attempt:
+                with _state_lock:
+                    # Conta quantos objetivos a tentativa atual alcançou
+                    current_oks = sum(1 for r in checks.values() if isinstance(r, dict) and r.get("ok"))
+                    
+                    # Conta quantos a "melhor até agora" alcançou
+                    best_oks = 0
+                    if _best_checks_so_far:
+                        best_oks = sum(1 for r in _best_checks_so_far.values() if isinstance(r, dict) and r.get("ok"))
+
+                    # Se a tentativa atual for melhor (ou se for a primeira), atualiza
+                    if current_oks > best_oks or _best_metrics_so_far is None:
+                        _best_metrics_so_far = metrics.copy()
+                        _best_checks_so_far = checks.copy()
+                        print(f"*** Nova melhor tentativa! Metas OK: {current_oks} ***")
+
 
             # Logs focados em pitch/afinação + loudness
             note_name = _hz_to_note_name_stub(f0) if f0 else "—"
@@ -365,6 +391,12 @@ def analysis_loop(device: Optional[int | str] = None):
                 _last_checks = checks
                 _last_line = line
 
+                # Se tem pitch/score válidos, guarda como "último válido"
+                if metrics.get("pitch_hz") is not None or metrics.get("tuning_score") is not None:
+                    _last_valid_metrics = metrics.copy()
+                    _last_valid_checks = checks.copy()
+                    _last_valid_line = line
+
             # ======== Streak de vitória ========
             if checks["overall_ok"]:
                 win_streak += 1
@@ -396,7 +428,7 @@ def analysis_loop(device: Optional[int | str] = None):
             pass
 
 # ===================== API =====================
-app = FastAPI(title="Audio Metrics API (sounddevice)", version="3.4.0")
+app = FastAPI(title="Audio Metrics API (sounddevice)", version="3.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -409,13 +441,16 @@ def _snapshot_for_response():
         return {
             "last_metrics": _last_metrics,
             "last_checks": _last_checks,
+            "last_valid_metrics": _last_valid_metrics,
+            "last_valid_checks": _last_valid_checks,
+            "best_metrics_so_far": _best_metrics_so_far,    # <<< NOVO
+            "best_checks_so_far": _best_checks_so_far,      # <<< NOVO
             "win_metrics": _win_metrics,
             "win_checks": _win_checks,
             "has_won": _has_won,
             "running": _is_running,
             "targets": TARGETS,
             "tuning_tolerance_cents": TUNING_TOLERANCE_CENTS,
-            # informativo (opcional para debug no front, se quiser usar /status):
             "streak_required": WIN_STREAK,
             "salience_min_db": SALIENCE_MIN_DB,
         }
@@ -433,7 +468,11 @@ def start_analysis(device: Optional[int | str] = None):
         _has_won = False
         _win_metrics = None
         _win_checks = None
-        _max_loudness_dbfs = None  # >>> zera pico ao iniciar
+        _max_loudness_dbfs = None
+        _last_valid_metrics = None
+        _last_valid_checks = None
+        _best_metrics_so_far = None  # <<< INICIALIZA O NOVO ESTADO
+        _best_checks_so_far = None   # <<< INICIALIZA O NOVO ESTADO
     _win_event.clear()
 
     if not (_worker_thread and _worker_thread.is_alive()):
@@ -443,6 +482,17 @@ def start_analysis(device: Optional[int | str] = None):
 
     # Loop de espera: vitória ou stop
     while True:
+        if _win_event.is_set(): # Checa se ganhou
+            snap = _snapshot_for_response()
+            return {
+                "ok": True,
+                "status": "parabens",
+                "message": "Parabéns! Você afinou dentro da meta.",
+                "metrics": snap["win_metrics"],
+                "checks": snap["win_checks"],
+                "targets": snap["targets"],
+                "tuning_tolerance_cents": snap["tuning_tolerance_cents"],
+            }
         if _stop_event.is_set():
             # Stop antes de ganhar
             snap = _snapshot_for_response()
@@ -457,20 +507,22 @@ def start_analysis(device: Optional[int | str] = None):
             }
         time.sleep(0.05)
 
+
 @app.get("/stop")
 def stop_analysis():
     """
     Para a análise imediatamente.
     - Se já tinha vitória: devolve 'parabéns' + métricas da vitória.
-    - Caso contrário: 'não foi dessa vez' + últimas métricas.
+    - Caso contrário: 'não foi dessa vez' + a MELHOR tentativa da sessão.
     """
     _stop_event.set()
 
-    # Espera a thread encerrar rapidamente (opcional)
     if _worker_thread and _worker_thread.is_alive():
         _worker_thread.join(timeout=1.0)
 
     snap = _snapshot_for_response()
+
+    # --- Caso tenha vencido ---
     if snap["has_won"] and snap["win_metrics"] is not None:
         return {
             "ok": True,
@@ -481,16 +533,31 @@ def stop_analysis():
             "targets": snap["targets"],
             "tuning_tolerance_cents": snap["tuning_tolerance_cents"],
         }
-    else:
-        return {
-            "ok": True,
-            "status": "nao_foi_dessa_vez",
-            "message": "Não foi dessa vez.",
-            "metrics": snap["last_metrics"],
-            "checks": snap["last_checks"],
-            "targets": snap["targets"],
-            "tuning_tolerance_cents": snap["tuning_tolerance_cents"],
-        }
+
+    # --- Caso não tenha vencido: RETORNA A MELHOR TENTATIVA ---
+    m = snap.get("best_metrics_so_far")
+    c = snap.get("best_checks_so_far")
+
+    # Fallback para a última válida se, por algum motivo, não houver "melhor"
+    if m is None:
+        m = snap.get("last_valid_metrics")
+        c = snap.get("last_valid_checks")
+    
+    # Fallback final para a última de todas se nada mais estiver disponível
+    if m is None:
+        m = snap.get("last_metrics")
+        c = snap.get("last_checks")
+
+    return {
+        "ok": True,
+        "status": "nao_foi_dessa_vez",
+        "message": "Não foi dessa vez. Aqui está sua melhor tentativa.",
+        "metrics": m,
+        "checks": c,
+        "targets": snap["targets"],
+        "tuning_tolerance_cents": snap["tuning_tolerance_cents"],
+    }
+
 
 @app.get("/status")
 def status():
