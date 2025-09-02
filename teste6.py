@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Meta visual de barra (0..150). Exige nível mínimo de entrada
 TARGETS_UI = {
-    "input_level": 50
+    "input_level": 100  # <<< OBJETIVO ATUALIZADO
 }
 
 
@@ -36,16 +36,17 @@ SR = 25_000        # taxa de amostragem (Hz). 16k = suficiente p/ voz; ↑ mais 
 CHANNELS = 1       # nº de canais. 1 = mono (voz). 2 = estéreo. Use mono p/ simplificar
 BLOCK_MS = 20      # duração de cada bloco de captura (ms). ↓ menor latência, ↑ mais CPU
 WINDOW_MS = 350    # janela de análise (ms). ↑ mais estável, ↓ responde mais devagar
-HOP_MS = 100       # << AJUSTADO PARA RESPOSTA MAIS RÁPIDA NO CONSOLE >>
+HOP_MS = 100       # passo entre análises (ms)
 BASELINE_SEC = 1.0 # tempo inicial (s) para medir ruído de fundo. ↑ pega baseline mais confiável
 EPS = 1e-12        # epsilon para evitar divisão por zero/log(0). Não precisa mexer
 
 
 # ======= GATES contra falsos positivos (em dBFS) =======
-LOUDNESS_FLOOR_DBFS = -45.0  # suba (ex.: -45) para aceitar janelas mais fracas
-MIN_SNR_DB = 35.0            # diminua (ex.: 18) p/ ambientes barulhentos
-VAD_FACTOR = 5.0             # diminua (ex.: 2.0) p/ detectar fala mais fraca
-MAX_NOISE_ZCR = 0.1         # aumente (ex.: 0.20) p/ ser menos rígido com ruído
+# <<< PARÂMETROS REBALANCEADOS (menos agressivos) >>>
+LOUDNESS_FLOOR_DBFS = -42.0
+MIN_SNR_DB = 28.0
+VAD_FACTOR = 3.0
+MAX_NOISE_ZCR = 0.15
 
 
 # ======= VITÓRIA: exigir estabilidade (streak) =======
@@ -147,17 +148,24 @@ def _audio_callback(indata, frames, time_info, status):
 
 ####
 
-
-def level_meter_value(dbfs: float, floor: float = -30.0, ceil: float = 0.0, max_ui: int = 150) -> int:
+# ================================================================
+# AQUI ESTÁ A MUDANÇA PRINCIPAL DE DIFICULDADE
+# ================================================================
+def level_meter_value(dbfs: float, floor: float = -40.0, ceil: float = 0.0, max_ui: int = 150) -> int:
     """
     Converte dBFS para um valor 0..max_ui (simula a barrinha do microfone).
-    floor: ruído de fundo (mínimo)
-    ceil: teto (0 dBFS digital)
     """
     norm = (dbfs - floor) / (ceil - floor)
-    return int(max(0, min(max_ui, norm * max_ui)))
+    raw_level = norm * max_ui
 
+    # Amassa a escala. O que era 140 agora vira 100.
+    # Fator de escala = (novo_ponto_dificil / antigo_ponto_dificil)
+    scaled_level = raw_level * (100.0 / 140.0)
 
+    return int(max(0, min(max_ui, scaled_level)))
+# ================================================================
+# FIM DA MUDANÇA
+# ================================================================
 
 
 # ===================== Loop de análise (worker) =====================
@@ -264,60 +272,46 @@ def analysis_loop(device: Optional[int | str] = None):
                 "loudness_dbfs_peak": None if _max_loudness_dbfs is None else float(_max_loudness_dbfs),
                 "loudness_db_spl": float(spl_est),
                 "loudness_db_spl_peak": None if spl_peak_est is None else float(spl_peak_est),
-                "input_level": level_meter_value(dbfs)  # 👈 barra do microfone
+                "input_level": level_meter_value(dbfs)
             }
 
             # -------- checar metas --------
             checks_spl = eval_goals_spl(metrics)
             checks_ui = eval_goals_ui(metrics)
 
-            # mescla os dois
             checks = {**checks_spl, **checks_ui}
             checks["overall_ok"] = checks_spl["overall_ok"] and checks_ui["overall_ok"]
             
-            # Vitória se passou em todas as metas
             if checks["overall_ok"]:
                 win_streak += 1
             else:
                 win_streak = 0
-
 
             # -------- salvar estado --------
             with _state_lock:
                 _last_metrics = metrics
                 _last_checks = checks
                 _last_line = f"SPL={spl_est:.1f} dB | input_level={metrics['input_level']} | streak={win_streak}"
-
                 _last_valid_metrics = metrics.copy()
                 _last_valid_checks = checks.copy()
                 _last_valid_line = _last_line
 
-            # =================================================================
-            # NOVO: LÓGICA PARA GUARDAR A MELHOR TENTATIVA
-            # =================================================================
+            # LÓGICA PARA GUARDAR A MELHOR TENTATIVA
             with _state_lock:
                 current_level = metrics.get('input_level', 0)
-                # Se ainda não temos uma "melhor tentativa" ou se a atual é melhor que a anterior
-                if _best_metrics_so_far is None or current_level > _best_metrics_so_far.get('input_level', 0):
-                    # Guardamos a medição atual como a melhor até agora
+                if not gates_fail and (_best_metrics_so_far is None or current_level > _best_metrics_so_far.get('input_level', 0)):
                     _best_metrics_so_far = metrics.copy()
                     _best_checks_so_far = checks.copy()
-            # =================================================================
-            # FIM DA LÓGICA
-            # =================================================================
             
-            # ================== NOVO: PRINT EM TEMPO REAL NO CONSOLE ==================
+            # PRINT EM TEMPO REAL NO CONSOLE
             bar_length = 30
             level = metrics.get('input_level', 0)
             level_scaled = int(max(0, level) / 150.0 * bar_length)
             bar = '█' * level_scaled + '─' * (bar_length - level_scaled)
             status_icon = "🟢" if not gates_fail else "🔴"
             
-            # O '\r' no início faz a linha ser sobrescrita
             print(f'\r{status_icon} SPL: {spl_est:5.1f} dB | Nível: [{bar}] {level:3d}/150 | Streak: {win_streak}  ', end="", flush=True)
-            # ========================================================================
             
-
             if (win_streak >= WIN_STREAK) and (not _has_won):
                 with _state_lock:
                     _has_won = True
@@ -328,7 +322,6 @@ def analysis_loop(device: Optional[int | str] = None):
     except Exception as e:
         print(f"Erro no stream: {e}")
     finally:
-        # NOVO: Adicionado para limpar a linha ao final
         print() 
         print("Análise encerrada.")
         try:
@@ -345,7 +338,7 @@ def analysis_loop(device: Optional[int | str] = None):
             pass
 
 # ===================== API =====================
-app = FastAPI(title="Audio Loudness API (SPL estimate)", version="4.1.0")
+app = FastAPI(title="Audio Loudness API (SPL estimate)", version="5.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -378,7 +371,7 @@ def _snapshot_for_response():
 @app.get("/start")
 def start_analysis(device: Optional[int | str] = None):
     """
-    BLOQUEIA até ganhar (pelas metas SPL) ou receber /stop.
+    BLOQUEIA até ganhar ou receber /stop.
     """
     global _worker_thread, _has_won, _win_metrics, _win_checks, _max_loudness_dbfs, _last_valid_metrics, _last_valid_checks, _best_metrics_so_far, _best_checks_so_far
     with _state_lock:
@@ -396,39 +389,41 @@ def start_analysis(device: Optional[int | str] = None):
         _stop_event.clear()
         _worker_thread = threading.Thread(target=analysis_loop, kwargs={"device": device}, daemon=True)
         _worker_thread.start()
+        print("Análise de áudio iniciada...")
 
-    while True:
-        if _win_event.is_set():
-            snap = _snapshot_for_response()
-            return {
-                "ok": True,
-                "status": "parabens",
-                "message": "Parabéns! Você atingiu o nível de volume (SPL) da meta.",
-                "metrics": snap["win_metrics"],
-                "checks": snap["win_checks"],
-                "targets_spl": snap["targets_spl"],
-                "assumed_baseline_spl_db": snap["assumed_baseline_spl_db"],
-                "units": snap["units"],
-            }
-        if _stop_event.is_set():
-            snap = _snapshot_for_response()
-            return {
-                "ok": True,
-                "status": "nao_foi_dessa_vez",
-                "message": "Não foi dessa vez.",
-                "metrics": snap["last_metrics"],
-                "checks": snap["last_checks"],
-                "targets_spl": snap["targets_spl"],
-                "assumed_baseline_spl_db": snap["assumed_baseline_spl_db"],
-                "units": snap["units"],
-            }
+    # Aguarda o evento de vitória ou de parada
+    while not _win_event.is_set() and not _stop_event.is_set():
         time.sleep(0.05)
+    
+    # Garante que o worker tenha tempo de salvar o último estado
+    time.sleep(0.1) 
+    snap = _snapshot_for_response()
+
+    if snap["has_won"]:
+        return {
+            "ok": True,
+            "status": "parabens",
+            "message": "Parabéns! Você atingiu a meta de nível.",
+            "metrics": snap["win_metrics"],
+            "checks": snap["win_checks"],
+        }
+    else:
+        # Se parou, retorna a melhor tentativa
+        return {
+            "ok": True,
+            "status": "nao_foi_dessa_vez",
+            "message": "Não foi dessa vez. Aqui está sua melhor tentativa.",
+            "metrics": snap["best_metrics_so_far"],
+            "checks": snap["best_checks_so_far"],
+        }
+
 
 @app.get("/stop")
 def stop_analysis():
     """
-    Para imediatamente. Se ganhou, retorna vitória; senão, melhor tentativa (SPL).
+    Para a análise e retorna o resultado.
     """
+    print("Comando /stop recebido.")
     _stop_event.set()
 
     if _worker_thread and _worker_thread.is_alive():
@@ -436,30 +431,21 @@ def stop_analysis():
 
     snap = _snapshot_for_response()
 
-    if snap["has_won"] and snap["win_metrics"] is not None:
+    if snap["has_won"]:
         return {
             "ok": True,
             "status": "parabens",
-            "message": "Parabéns! Você atingiu o nível de volume (SPL) da meta.",
+            "message": "Parabéns! Você atingiu a meta de nível.",
             "metrics": snap["win_metrics"],
             "checks": snap["win_checks"],
-            "targets_spl": snap["targets_spl"],
-            "assumed_baseline_spl_db": snap["assumed_baseline_spl_db"],
-            "units": snap["units"],
         }
-
-    m = snap.get("best_metrics_so_far") or snap.get("last_valid_metrics") or snap.get("last_metrics")
-    c = snap.get("best_checks_so_far") or snap.get("last_valid_checks") or snap.get("last_checks")
-
+    
     return {
         "ok": True,
         "status": "nao_foi_dessa_vez",
-        "message": "Não foi dessa vez. Aqui está sua melhor tentativa (SPL estimado).",
-        "metrics": m,
-        "checks": c,
-        "targets_spl": snap["targets_spl"],
-        "assumed_baseline_spl_db": snap["assumed_baseline_spl_db"],
-        "units": snap["units"],
+        "message": "Análise parada. Aqui está sua melhor tentativa.",
+        "metrics": snap["best_metrics_so_far"],
+        "checks": snap["best_checks_so_far"],
     }
 
 @app.get("/status")
