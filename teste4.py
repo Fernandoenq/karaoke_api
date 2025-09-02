@@ -11,6 +11,12 @@ import sounddevice as sd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+
+
+import sounddevice as sd
+
+
+
 # ===================== Metas (foco em PITCH e AFINAÇÃO) =====================
 TARGETS = {
     #seria a nota
@@ -196,6 +202,66 @@ def _audio_callback(indata, frames, time_info, status):
         except:
             pass
 
+
+
+import sounddevice as sd
+
+def open_input_stream(device=None, callback=None):
+    """
+    Abre InputStream de forma robusta:
+      1. Descobre o sample rate padrão do dispositivo.
+      2. Se falhar, tenta 48000 Hz e 44100 Hz.
+    Retorna (stream, device_sr).
+    """
+    stream = None
+    device_sr = None
+    last_err = None
+
+    # 1. Tenta pegar o default do dispositivo
+    try:
+        info = sd.query_devices(device, 'input') if device is not None else sd.query_devices(kind='input')
+        device_sr = int(round(info['default_samplerate']))
+        print(f"🎤 Usando sample rate padrão do device: {device_sr} Hz")
+
+        stream = sd.InputStream(
+            samplerate=device_sr,
+            channels=1,
+            dtype="float32",
+            blocksize=0,   # deixa o driver escolher
+            device=device,
+            callback=callback,
+        )
+        stream.start()
+        return stream, device_sr
+    except Exception as e:
+        print(f"⚠️ Falhou ao abrir com default SR ({device_sr}): {e}")
+        last_err = e
+
+    # 2. Se falhar, tenta manualmente com 48k e 44.1k
+    for sr_try in (48000, 44100):
+        try:
+            print(f"🔄 Tentando abrir com {sr_try} Hz...")
+            stream = sd.InputStream(
+                samplerate=sr_try,
+                channels=1,
+                dtype="float32",
+                blocksize=0,
+                device=device,
+                callback=callback,
+            )
+            stream.start()
+            device_sr = sr_try
+            print(f"✅ Funcionou com {sr_try} Hz")
+            return stream, device_sr
+        except Exception as e:
+            print(f"❌ Falhou com {sr_try} Hz: {e}")
+            last_err = e
+
+    # 3. Se nada funcionar, estoura erro
+    raise RuntimeError(f"Não foi possível abrir a entrada de áudio: {last_err}")
+
+
+
 # ===================== Loop de análise (worker) =====================
 def analysis_loop(device: Optional[int | str] = None):
     global _is_running, _last_metrics, _last_checks, _last_line, _has_won, _win_metrics, _win_checks, _max_loudness_dbfs, _best_metrics_so_far, _best_checks_so_far
@@ -216,12 +282,15 @@ def analysis_loop(device: Optional[int | str] = None):
         device=device,
         callback=_audio_callback,
     )
-
     try:
         _stop_event.clear()
-        stream.start()
+        stream, device_sr = open_input_stream(device, callback=_audio_callback)
         with _state_lock:
             _is_running = True
+
+        print(f"🎶 Microfone aberto em {device_sr} Hz (vai ser resampleado para {SR})")
+        # aqui você continua o loop de análise...
+
 
         # ======== baseline ========
         need_baseline = int(SR * BASELINE_SEC)
