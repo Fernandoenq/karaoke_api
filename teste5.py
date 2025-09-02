@@ -12,10 +12,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # ===================== Metas =====================
+
+# Meta visual de barra (0..150). Exige nível mínimo de entrada
+TARGETS_UI = {
+    "input_level": 140
+}
+
+
 # Alvos em dB SPL (estimados) — ajuste à sua experiência de jogo
 TARGETS_SPL = {
-    "loudness_db_spl": 80.0,        # alvo de "média" / janela
-    "loudness_db_spl_peak": 85.0,   # alvo de pico
+  
 }
 
 # Mantemos dBFS só para gates e depuração (não para "parabéns")
@@ -77,6 +83,19 @@ _max_loudness_dbfs: Optional[float] = None
 _audio_q: Queue[np.ndarray] = Queue(maxsize=256)
 
 # ===================== Utilitários =====================
+
+
+def eval_goals_ui(metrics: dict) -> dict:
+    results = {}
+    for key, target in TARGETS_UI.items():
+        val = metrics.get(key, None)
+        ok = (val is not None) and (val >= target)
+        results[key] = {"value": val, "target": target, "ok": ok}
+    results["overall_ok"] = all(v["ok"] for v in results.values())
+    return results
+
+
+
 def rms_dbfs(x: np.ndarray):
     rms = float(np.sqrt(np.mean(x**2) + EPS))
     db = 20.0 * np.log10(rms + EPS)
@@ -123,9 +142,29 @@ def _audio_callback(indata, frames, time_info, status):
         except:
             pass
 
+
+
+
+####
+
+
+def level_meter_value(dbfs: float, floor: float = -60.0, ceil: float = 0.0, max_ui: int = 150) -> int:
+    """
+    Converte dBFS para um valor 0..max_ui (simula a barrinha do microfone).
+    floor: ruído de fundo (mínimo)
+    ceil: teto (0 dBFS digital)
+    """
+    norm = (dbfs - floor) / (ceil - floor)
+    return int(max(0, min(max_ui, norm * max_ui)))
+
+
+
+
 # ===================== Loop de análise (worker) =====================
 def analysis_loop(device: Optional[int | str] = None):
-    global _is_running, _last_metrics, _last_checks, _last_line, _has_won, _win_metrics, _win_checks, _max_loudness_dbfs, _best_metrics_so_far, _best_checks_so_far
+    global _is_running, _last_metrics, _last_checks, _last_line, _has_won
+    global _win_metrics, _win_checks, _max_loudness_dbfs
+    global _best_metrics_so_far, _best_checks_so_far
 
     block_samples = max(1, int(SR * (BLOCK_MS / 1000.0)))
     window_samples = max(block_samples, int(SR * (WINDOW_MS / 1000.0)))
@@ -161,11 +200,6 @@ def analysis_loop(device: Optional[int | str] = None):
                     noise_rms, noise_dbfs = rms_dbfs(noise)
                     got_baseline = True
                     print(f"Baseline ruído: dBFS={noise_dbfs:.2f} (assumido ≈ {ASSUMED_BASELINE_SPL_DB:.1f} dB SPL)")
-                    print(
-                        f"Metas SPL (>=): {TARGETS_SPL} | SR={SR}Hz, WINDOW={WINDOW_MS}ms, HOP={HOP_MS}ms, "
-                        f"VAD={VAD_FACTOR}x, Gates(dBFS): floor={LOUDNESS_FLOOR_DBFS}dBFS, "
-                        f"SNR>={MIN_SNR_DB}dB, ZCR<{MAX_NOISE_ZCR}, WIN_STREAK={WIN_STREAK}"
-                    )
             except Empty:
                 continue
         if not got_baseline:
@@ -178,6 +212,7 @@ def analysis_loop(device: Optional[int | str] = None):
         with _state_lock:
             _max_loudness_dbfs = None
 
+        # ======== loop principal ========
         while not _stop_event.is_set():
             try:
                 chunk = _audio_q.get(timeout=0.2)
@@ -193,9 +228,14 @@ def analysis_loop(device: Optional[int | str] = None):
             x = np.frombuffer(np.array(ring, dtype=np.float32), dtype=np.float32)
             samples_since_last = 0
 
-            # Métricas principais (em dBFS)
+            # -------- Métricas principais --------
             rms, dbfs = rms_dbfs(x)
-            snr_db = 20.0 * np.log10((rms + EPS) / (10**(noise_dbfs/20.0) + EPS))  # SNR em dB aproximado
+            if dbfs > 0:
+                dbfs = 0.0
+            if dbfs < -120:
+                dbfs = -120.0
+
+            snr_db = 20.0 * np.log10((rms + EPS) / (10**(noise_dbfs/20.0) + EPS))
             _, _, zcr = spectral_features(x, SR)
             speaking = rms > (10**(noise_dbfs/20.0) * VAD_FACTOR)
 
@@ -205,91 +245,47 @@ def analysis_loop(device: Optional[int | str] = None):
             noise_like = (zcr > MAX_NOISE_ZCR and dbfs < (LOUDNESS_FLOOR_DBFS + 5.0))
             gates_fail = is_silence or snr_bad or noise_like or (not speaking)
 
-            # Atualiza pico dBFS se passou gates
+            # Atualiza pico dBFS
             if not gates_fail:
                 with _state_lock:
                     if (_max_loudness_dbfs is None) or (dbfs > _max_loudness_dbfs):
                         _max_loudness_dbfs = float(dbfs)
 
-            # Converte para dB SPL estimado
+            # SPL estimado
             spl_est = dbfs_to_spl_est(dbfs, noise_dbfs, ASSUMED_BASELINE_SPL_DB)
             spl_peak_est = None
             with _state_lock:
                 if _max_loudness_dbfs is not None:
                     spl_peak_est = dbfs_to_spl_est(_max_loudness_dbfs, noise_dbfs, ASSUMED_BASELINE_SPL_DB)
 
-            if gates_fail:
-                with _state_lock:
-                    _last_metrics = {
-                        # dBFS (debug)
-                        "loudness_dbfs": float(dbfs),
-                        "loudness_dbfs_peak": None if _max_loudness_dbfs is None else float(_max_loudness_dbfs),
-                        # dB SPL estimado (o que interessa pro jogo)
-                        "loudness_db_spl": float(spl_est),
-                        "loudness_db_spl_peak": None if spl_peak_est is None else float(spl_peak_est),
-                    }
-                    _last_checks = None
-                    _last_line = (
-                        f"[skip] SPL~{spl_est:.1f} dB / dBFS={dbfs:.1f} | SNR={snr_db:.1f} | ZCR={zcr:.3f} | speaking={speaking}"
-                    )
-                win_streak = 0
-                continue
+            # -------- montar métricas --------
+            metrics = {
+                "loudness_dbfs": float(dbfs),
+                "loudness_dbfs_peak": None if _max_loudness_dbfs is None else float(_max_loudness_dbfs),
+                "loudness_db_spl": float(spl_est),
+                "loudness_db_spl_peak": None if spl_peak_est is None else float(spl_peak_est),
+                "input_level": level_meter_value(dbfs)  # 👈 barra do microfone
+            }
 
-            # ======== Apenas LOUDNESS (agora avaliado em SPL estimado) ========
-            with _state_lock:
-                metrics = {
-                    # dBFS (debug)
-                    "loudness_dbfs": float(dbfs),
-                    "loudness_dbfs_peak": None if _max_loudness_dbfs is None else float(_max_loudness_dbfs),
-                    # dB SPL estimado
-                    "loudness_db_spl": float(spl_est),
-                    "loudness_db_spl_peak": None if spl_peak_est is None else float(spl_peak_est),
-                }
-            checks = eval_goals_spl(metrics)
+            # -------- checar metas --------
+            checks_spl = eval_goals_spl(metrics)
+            checks_ui = eval_goals_ui(metrics)
 
-            # “melhor até agora” com base nos alvos SPL
-            with _state_lock:
-                current_oks = sum(1 for r in checks.values() if isinstance(r, dict) and r.get("ok"))
-                best_oks = 0
-                if _best_checks_so_far:
-                    best_oks = sum(1 for r in _best_checks_so_far.values() if isinstance(r, dict) and r.get("ok"))
-                if current_oks > best_oks or _best_metrics_so_far is None:
-                    _best_metrics_so_far = metrics.copy()
-                    _best_checks_so_far = checks.copy()
-                    print(f"*** Nova melhor tentativa (SPL)! Metas OK: {current_oks} ***")
+            # mescla os dois
+            checks = {**checks_spl, **checks_ui}
+            checks["overall_ok"] = checks_spl["overall_ok"] and checks_ui["overall_ok"]
 
-            # Logs
-            with _state_lock:
-                peak_show_spl = None if spl_peak_est is None else float(spl_peak_est)
-            line = (
-                f"[fala={speaking}] SPL~{spl_est:.1f} dB (peak~{(peak_show_spl if peak_show_spl is not None else float('nan')):.1f} dB) "
-                f"| dBFS={dbfs:.1f} (peak={(_max_loudness_dbfs if _max_loudness_dbfs is not None else float('nan')):.1f}) "
-                f"| SNR={snr_db:.1f} dB | ZCR={zcr:.3f} | streak={win_streak}"
-            )
-
-            parts = []
-            for k, r in checks.items():
-                if k == "overall_ok":
-                    continue
-                val, tgt, ok = r["value"], r["target"], r["ok"]
-                parts.append(f"{k}: {'✓' if ok else '✗'}({val:.1f} ≥ {tgt:.1f})")
-            goals_line = " | ".join(parts)
-            overall = "OK" if checks["overall_ok"] else "FAIL"
-
-            print(line)
-            print(f"METAS SPL [{overall}] -> {goals_line}\n")
-
-            # Snapshots
+            # -------- salvar estado --------
             with _state_lock:
                 _last_metrics = metrics
                 _last_checks = checks
-                _last_line = line
+                _last_line = f"SPL={spl_est:.1f} dB | input_level={metrics['input_level']} | streak={win_streak}"
 
                 _last_valid_metrics = metrics.copy()
                 _last_valid_checks = checks.copy()
-                _last_valid_line = line
+                _last_valid_line = _last_line
 
-            # Vitória por metas SPL
+            # Vitória se passou em todas as metas
             if checks["overall_ok"]:
                 win_streak += 1
             else:
